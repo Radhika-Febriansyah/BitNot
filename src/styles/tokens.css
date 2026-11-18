@@ -1,0 +1,83 @@
+/* BitNot design tokens.
+   Sizes were measured from the approved UI reference (a third-party screenshot
+   kept out of the public repository; see docs/implementation-log.md),
+   which is a 1440x900 layout rendered at 1.333x (reference px * 0.75 = CSS px).
+   Brand colours come from CLAUDE.md §3. --accent / --accent-ink are set at
+   runtime from the user's settings. All sizes are rem so display scale works. */
+
+:root {
+  --accent: #36c5f0;
+  --accent-ink: #0b111b;
+
+  --font-sans: "Inter Variable", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+
+  --fs-xs: 0.75rem; /* 12 — table header, times */
+  --fs-sm: 0.8125rem; /* 13 — secondary lines */
+  --fs-md: 0.90625rem; /* 14.5 — row titles, body */
+  --fs-nav: 0.9375rem; /* 15 — sidebar navigation */
+  --fs-lg: 1.1875rem; /* 19 — panel headings */
+  --fs-page: 2rem; /* page titles */
+  --fs-hero: 3.375rem; /* 54 — playlist title */
+
+  --titlebar-h: 32px;
+  --sidebar-w: 15.75rem; /* 252 */
+  --sidebar-rail-w: 4.5rem;
+  --queue-w: 22.5rem; /* 360 */
+  --player-h: 5.5rem; /* 88 */
+  --gutter: 1.5rem; /* 24 — centre column padding */
+
+  --radius-art: 0.1875rem; /* 3 */
+  --radius-row: 0.375rem; /* 6 */
+  --radius-pill: 999px;
+
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --dur-fast: 100ms;
+  --dur-med: 180ms;
+}
+
+:root[data-motion="reduce"] {
+  --dur-fast: 0ms;
+  --dur-med: 0ms;
+}
+
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0b111b;
+  --bg-panel: #0f1724;
+  --surface: #172333;
+  --surface-hover: #1e2c40;
+  --row-hover: rgb(243 247 250 / 0.045);
+  --row-active: rgb(243 247 250 / 0.08);
+  --border: rgb(243 247 250 / 0.09);
+  --border-strong: rgb(243 247 250 / 0.18);
+  --text: #f3f7fa;
+  --text-muted: #a3b0bf;
+  --text-faint: #7d8da0;
+  --accent-text: var(--accent);
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --danger: #ff6b6b;
+  --shadow-art: 0 0.5rem 1.5rem rgb(0 0 0 / 0.45);
+  --shadow-pop: 0 0.75rem 2.5rem rgb(0 0 0 / 0.55);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f3f7fa;
+  --bg-panel: #e9eef4;
+  --surface: #dde5ee;
+  --surface-hover: #d0dae6;
+  --row-hover: rgb(11 17 27 / 0.05);
+  --row-active: rgb(11 17 27 / 0.09);
+  --border: rgb(11 17 27 / 0.1);
+  --border-strong: rgb(11 17 27 / 0.22);
+  --text: #0b111b;
+  --text-muted: #46566a;
+  --text-faint: #586777;
+  /* The raw accent is too pale for text on a light background. */
+  --accent-text: color-mix(in srgb, var(--accent) 52%, #0b111b);
+  --accent-soft: color-mix(in srgb, var(--accent) 24%, transparent);
+  --danger: #c62f3b;
+  --shadow-art: 0 0.5rem 1.5rem rgb(11 17 27 / 0.18);
+  --shadow-pop: 0 0.75rem 2.5rem rgb(11 17 27 / 0.2);
+}
