@@ -194,3 +194,149 @@ Profile database v3 (additive): `playlists.cover`, `playlists.deleted_at`, `trac
   - `src-tauri/icons/icon.ico`: 16, 20, 24, 32, 40, 48, 64, and 256 px, each rendered separately. Sizes up to 48 px let the mark fill more of the tile so it stays readable; its shape is unchanged.
 - **Transparency:** the note and inner wave lines are cut-outs in the approved design, so in the transparent mark they show whatever is behind. On light backgrounds they appear light.
 - **Old logo:** `logo-1024.png` and `logo-source.webp` were moved to `docs/design/brand/archive/`, which is excluded from publication locally.
+
+## Phase 3 — Premium player experience (started 2026-11-18)
+
+Assessment, risks, sequence, and the audio-pipeline proof of concept plan: `docs/reports/phase-3-assessment.md`.
+
+### Milestone 1, step 1: keyboard shortcuts
+
+- **Mapping** (`src/lib/shortcuts.ts`): the fixed set from the specification (Space, Ctrl+→/←, Ctrl+↑/↓, Ctrl+F) plus three additions that need no new product decision: Ctrl+Shift+→/← seek ±10 s, Ctrl+M mute, F1 or ? show the shortcut list. Volume steps by 5. Only volume and seek repeat while a key is held.
+- **Not hijacking:** while typing in a text field only Ctrl+F (and F1) act. Space on a focused button, link, row, or other control keeps its native meaning. Nothing acts while a dialog or menu is open, or when another handler already handled the key. Alt and Windows-key combinations are left to the system.
+- **Mute:** sets the engine volume to 0 without changing the saved volume; any volume change unmutes. Mute is not persisted (a restart starts unmuted).
+- **Discoverability:** player-bar tooltips show the shortcut (e.g. "Next (Ctrl+→)"); the volume icon is a mute button; the list is in a dialog (F1/?) and in Settings → Keyboard shortcuts.
+- **Scope:** shortcuts work while the BitNot window has focus. System-wide media keys belong to Phase 5 (Windows Media Session).
+- **Verified** in the running app with real key events: play/pause, next/previous (no action past the end of the queue), seek ±10 s, volume up/down with the saved setting following, mute and unmute through Ctrl+↑, Ctrl+F focus, Space and letters typed into search without toggling playback, F1 and ? open the dialog, Escape closes it.
+- **Not yet verified:** a physical keyboard pass and a Narrator pass.
+
+### Milestone 1, step 2: Now Playing
+
+- **Page** (`src/pages/NowPlaying.tsx`, route `nowPlaying`): full-size artwork, title, links to the artist and album pages, the source's format line, a Favorites toggle, Song details (technical information stays there), seek bar, transport (shuffle, previous, play/pause, next, repeat), and volume. With nothing loaded it shows an empty state with a Browse your library button.
+- **Shared controls** (`src/components/PlayerControls.tsx`): the player bar and Now Playing use the same seek bar, transport, and volume components, so they cannot drift apart.
+- **Layouts:** Centered (artwork in the middle, everything below) and Split (artwork left; details, controls, and the next five tracks of the queue on the right, then "and N more"). Below 1100 px window width Split stacks into one centred column. The choice is a per-profile setting, `nowPlayingLayout` (`centered` by default), switchable on the page and in Settings → Appearance; the core rejects any other value.
+- **Opening it:** the current track in the player bar is a button (Open Now Playing / Close Now Playing, with `aria-pressed`). Closing goes back to the previous page, or Home when Now Playing was restored with no history behind it. The page is restored after a restart like any other page.
+- **Motion:** artwork fades in on track change using the shared duration tokens, so Reduce Motion turns it off.
+- **Defect fixed (from Phase 1):** the last page was compared with the value loaded at start, so returning to that page later in the session (e.g. Now Playing → artist → Now Playing) was not saved and a restart opened the wrong page. It is now compared with the last value written, per profile. Covered by `src/state/AppContext.test.tsx`, which fails without the fix.
+- **Verified in the running app:** both layouts with and without artwork; Next Up listing and "and 1 more" with a 7-track queue; "Nothing is queued after this track"; favourite toggle syncing with the player-bar heart; Song details; artist link; open/close from the player bar returning to the previous page; Space toggling playback on the page; stacked Split at 1000 px with the queue as an overlay; layout and page restored after reload.
+- **Not yet verified:** a Narrator pass over the page and the player-bar button.
+
+### Milestone 1, step 3: Sleep timer
+
+- **Choices:** 15, 30, 45, or 60 minutes, and Stop after current track (an addition to CLAUDE.md §20, approved 2026-11-18). Picking a choice replaces the one set before. Turn off sleep timer cancels.
+- **Where it lives:** `src-tauri/src/sleep.rs`, owned by the playback controller. A fixed length is an end time on `std::time::Instant`, which is monotonic, so changing the Windows clock or time zone cannot move it. The existing 250 ms playback ticker checks it with one comparison, so no thread, timer, or polling was added. The core rejects any other length.
+- **When it runs out:**
+  - Playback pauses; the track and position stay. Taking the end time and disarming the timer happen in one step, so it fires once; music started again afterwards keeps playing.
+  - It counts real time, including while paused. If it runs out while paused, it is simply used up.
+  - Seeking and skipping do not change it.
+  - The window shows "Sleep timer ended. Playback is paused." (event `playback:sleep-ended`).
+- **Stop after current track:**
+  - It waits for the player's own "finished" event, not a time computed from the track length, so seeking, pausing, and skipping cannot make it fire early.
+  - When the song ends, the next song is not started. The queue still moves to it, following repeat and shuffle (Repeat One leaves the same song ready, Repeat All wraps to the first, and at the end of the queue it stays on the last song). Play then continues where the queue would have gone. The next song is not counted as played until it actually starts.
+  - It applies to whichever song is playing when one ends, so after a manual skip it stops after the new song.
+  - It needs a song in the queue, and the menu item is disabled otherwise.
+- **Not kept across a restart.** CLAUDE.md does not ask for it, and a timer that silently came back could pause music started on purpose in a new session. A profile switch also cancels it. Shutdown needs nothing extra, because the timer is only in memory.
+- **Interface:**
+  - A moon button in the player bar opens the choices as radio menu items, with the active one checked; it is keyboard-operable and returns focus to the button.
+  - While a timer is set, the moon turns the accent colour and shows the time left (m:ss, rounded up) or "End of track". The button's name says the same, e.g. "Sleep timer: 14:41 left".
+  - The countdown starts from the time left that the core reports with every playback state and runs on the browser's monotonic clock, updating once a second only while a fixed-length timer is set. A window reload picks it up again from the core.
+  - Setting, cancelling, and expiry are confirmed with a message.
+- **Menu component:** items may now be marked `checked`, which renders them as `menuitemradio` with `aria-checked` and a check mark.
+- **Tests:**
+  - Rust (17 new): each length expires at its end time and not 1 ms before; it fires once; wall-clock jumps have no effect; pause and resume; cancel; seek and skip; stop-after-track including Repeat One, Repeat All, repeat off at the end of the queue, and shuffle; manual skip; no track and no audio device; restart, profile switch, and reset.
+  - Frontend (8 new): labels, rounding, the countdown and its resynchronisation, the menu's choices and checked state, the disabled stop-after-track item without a track, cancel, and radio menu items.
+- **Verified in the running app:**
+  - The menu opened and Stop after current track was chosen with the keyboard; focus went back to the button.
+  - Stop after current track let Harbor Lights finish, did not start Night Bus, and left it ready at 0:00 with its play count unchanged.
+  - A 15-minute timer counted down in the player bar.
+  - A window reload resynchronised the countdown.
+  - It kept counting real time through a 20-second pause.
+  - It looked right in both themes.
+  - A full 15-minute run (set at 17:29:23, with Repeat All on) had paused by the first check after the end time (17:44:28; checks every 5 s). The position was kept at 0:05 in the song, the message appeared, and playback stayed paused.
+- **Limits:**
+  - It pauses at once, without a fade (a fade needs the audio pipeline work in the proof of concept).
+  - It fires within one ticker interval (at most 250 ms late).
+  - If the computer sleeps, Windows may not advance the monotonic clock while suspended, so the timer can end later than the wall-clock time suggests. No music plays during suspend in any case.
+
+### Milestone 1, step 4: Dated playback clock
+
+- **Why:** the position reached the window only with each progress event (every 250 ms), so the seek bar moved in visible jumps. Synchronised lyrics and the visualizer will also need a position between events.
+- **Core:**
+  - Every `playback:progress` event and every playback state now carries `clockMs`: the core's monotonic time (`std::time::Instant` since the first reading in the process, `monotonic_ms` in `playback.rs`) when the position was read. Wall-clock time is not used.
+  - Existing fields are unchanged; `clockMs` was only added. The core stays the authority, and nothing about queue, repeat, shuffle, the sleep timer, or audio output changed.
+- **Window** (`src/lib/playbackClock.ts`, no React inside):
+  - **Lining up the clocks:** it learns how the core's monotonic time lines up with `performance.now()`, taking the smallest difference seen (each reading arrives late by its delivery time, never early). That figure may grow by at most 1 ms per second, to allow for slow drift between the two clocks.
+  - **Estimating:** while playing, the position is the reading plus the time since it was taken. A late or irregular reading therefore adds no error, and nothing accumulates.
+  - **Limits:** the estimate stops at the track's duration, and at 1 s past the newest reading if readings stop arriving.
+  - **Paused or stopped:** it shows the reading unchanged.
+  - **Snapping:** a seek (disagreement over 300 ms), a track change, a pause, or a stop is shown at once. A smaller backwards correction is absorbed by holding the shown position until the estimate passes it, so the bar never twitches backwards.
+  - **Out-of-order readings:** a reading older than one already applied is ignored, for example a progress event delivered after the result of a seek.
+- **Rendering:**
+  - The clock lives in its own React context and is never replaced. `usePosition(granularity)` re-renders a component only when the position enters a new step.
+  - The seek bar uses about a thousand steps per track (16 ms to 1 s), so it moves by under a pixel at a time without re-rendering on every frame. A 3-minute track re-renders it about 5 times a second.
+  - Animation frames run only while playing, while a seek bar is mounted, while the window is visible, and while the estimate can still move.
+  - With Reduce Motion, the bar steps once a second.
+- **Seek bar:** the slider now has 1 ms steps, so its thumb (shown on hover and focus) follows the smooth fill. Arrow keys still move 1 s and Page Up/Down 10 s, as before; Ctrl/Shift arrows remain app shortcuts. The player bar and Now Playing use the same component and the same clock, so they always show the same position.
+- **Tests:** 1 Rust (dated readings for play, pause, track change, stop, and state) and 18 frontend:
+  - `playbackClock.test.ts` covers moving while playing, holding while paused, resuming, seeks both ways, absorbing small corrections, track and duration changes, stopping, late and irregular readings without drift (50 rounds, error at most 5 ms), ignoring stale readings, the duration and look-ahead caps, step-based re-rendering, two subscribers in step, frames only when needed, and the sleep-timer pause.
+  - `SeekBar.test.tsx` covers two bars sharing one clock, dragging while it runs, keyboard steps, and Reduce Motion.
+  - `LibraryContext.test.tsx` covers events feeding the clock and relative seeking.
+- **Verified in the running app** (8-second test tracks):
+  - Sampling both bars on every frame for 1.5 s gave 95 distinct positions, none backwards, the two bars identical on every frame, and the largest step 28 ms.
+  - Against fresh readings from the core, the shown position was within 20 ms, including the delivery delay.
+  - Pausing froze both bars at the core's exact position; resuming moved on.
+  - Seeking with the arrow keys on the bar and with Ctrl+Shift+Right snapped at once.
+  - A track change reset both bars and the Now Playing title.
+  - Stop after current track still stopped on time, with the bars frozen at 0.
+- **Limits:**
+  - The position is where the decoder is, which runs ahead of the speakers by the output buffer (tens of milliseconds). That is not corrected here; it matters for lyrics and the visualizer and is noted for the proof of concept.
+  - Playback speed is assumed to be 1×, as BitNot has no speed control.
+
+### Audio pipeline proof of concept (2026-11-19)
+
+Full results, method, environment, and recommendation: `docs/reports/phase-3-assessment.md`, section 9.
+
+- **What was built:** a standalone example, `src-tauri/examples/audio_poc/`, not wired into the app. The production engine, the `Output` trait, and existing tests are unchanged, and no dependency was added (cpal is used through rodio's re-export).
+  - It generates its own deterministic test audio (WAV, AIFF, and FLAC through a small verbatim writer, since no encoder is installed).
+  - It runs seven experiments: gapless, EQ, crossfade, capture, CPU, rodio on the device, and direct cpal.
+- **Decision: keep rodio and extend it.**
+  - Gapless joins are bit-identical when the next track is appended early; this held on the real device too.
+  - Flat EQ and an idle limiter are bit-exact.
+  - The equal-power crossfade holds level within the material's own variation, and the handover point is exact to the frame.
+  - The visualizer ring never blocks the audio side.
+  - With all features running: 8 ms of CPU per second of audio, and 0 missed callbacks in 3 × 20 s on the device.
+- **Defects found in the current engine** (not fixed; awaiting approval):
+  1. rodio's 44.1 → 48 kHz conversion is linear interpolation and restarts at every decoder packet: THD+N −34.5 dB at 1 kHz, −7.4 dB at 16 kHz, timing steps of a few µs, and 10 extra frames per 2 s. Feeding rodio audio already at the device rate avoids it bit-exactly; a windowed-sinc stage in the PoC reached the file's own noise floor (−92 dB) for about 2 ms of CPU per second.
+  2. Because `DeviceOutput` connects its `Player` before anything is queued, the first track after start-up plays its first 10.7 ms as mono at half speed and runs 5.3 ms late. The fix is to connect after the first append.
+- **EQ design facts:** RBJ biquads and Simper SVFs have identical static response. Under live gain changes the SVF is much cleaner (−54 dB click level at a 30 ms glide with per-frame updates, against −11.5 dB for the biquad), so the production EQ should use SVFs. Neighbouring bands interact; with all bands at −12 dB the middle measures −18.3 dB.
+- **Not covered:**
+  - MP3/AAC encoder-delay gapless (no encoder available).
+  - Listening tests (device runs are muted).
+  - Other devices, Windows 10, and exclusive mode.
+  - Output latency through rodio (not exposed; cpal reports 31.8 ms on this device).
+- **Reproduce:** `cargo run --release --example audio_poc -- all`, from `src-tauri/`.
+
+### Engine defect fixes (2026-11-19)
+
+Details, measurements, and corrections to the proof-of-concept record: `docs/reports/phase-3-assessment.md`, section 10.
+
+- **Fix:** a new output stage, `src-tauri/src/resample.rs`, sits between the rodio Player's queue and the device mixer. `DeviceOutput::on_mixer` creates the Player unconnected and adds only the stage to the mixer.
+  - The stage always presents stereo at the device rate, read from the stream that was opened (`sink.config()`, now logged). The mixer therefore never resamples and never reads the empty queue's mono format.
+  - This fixes the first-track glitch (the first 10.7 ms as mono at half speed, then 5.3 ms late) and rodio's linear-interpolation resampling (THD+N −34.5 dB at 1 kHz, −7.4 dB at 16 kHz).
+- **Resampler:**
+  - In-house windowed sinc: 96 taps at the lower rate, Kaiser β 9, cut-off 0.97, a table of 512 entries per sample.
+  - The read position is an exact fraction, so there is no drift.
+  - It runs on the continuous queue output, and same-rate audio is passed through bit-exact.
+  - `rubato` (MIT) was considered and not added: several extra crates, and the streaming and boundary handling would still be needed.
+  - The PoC's 32-tap version was replaced after measuring its response (−5.7 dB at 20 kHz). The production filter is flat to 20 kHz, with 91.5 dB of alias suppression.
+- **Track boundaries:** rodio's queue reports the wrong format for the first samples of a new track (decoders never report themselves finished). Each appended track is now wrapped in `Marked`, which records its format on its first sample, so the stage switches rate and channel count on the exact sample.
+- **Results:**
+  - 44.1 → 48 kHz: THD+N −97.5 to −116 dB from 1 to 20 kHz, gain within 0.001 dB.
+  - 10 s gives exactly 480 000 frames, with no drift.
+  - Track joins at the same rate are continuous; a 48 kHz track after a 44.1 kHz one is bit-exact.
+  - Cost: 12.7 ms of CPU per second of audio (release).
+- **Tests:** 13 new (10 for the stage, 3 driving the real `DeviceOutput` on an offline mixer, including one that reproduces the original rodio defect). 145 Rust tests pass over 5 runs.
+- **On the device** (WASAPI loopback, with another application playing throughout):
+  - The first 44.1 kHz track after start-up played at 996.9998 Hz with 0.02 dB coherence loss, against 996.9026 Hz and 7.81 dB for the old path on the same file. 48 kHz was exact.
+  - Volume changes, seek, pause and resume, and 44.1 ↔ 48 kHz track changes worked in the app.
+  - No listening test was performed.
+- **Not done:** gapless, EQ, crossfade, visualizer (unchanged scope); hardware tests at other device rates or channel counts; lossy formats measured through the stage.

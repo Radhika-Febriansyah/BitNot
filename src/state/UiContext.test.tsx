@@ -63,6 +63,34 @@ const open = (context: Partial<TrackContext> = {}) =>
   act(() => ui.openTrackMenu(track, { list: [track], index: 0, ...context }, 10, 10));
 const items = () => screen.getAllByRole("menuitem").map((item) => item.textContent);
 
+describe("menu choices", () => {
+  it("marks a group of choices as radio items with the chosen one checked", () => {
+    const pick = vi.fn();
+    act(() =>
+      ui.openMenu(
+        [
+          { label: "15 minutes", checked: false, onSelect: pick },
+          { label: "30 minutes", checked: true },
+          { separator: true },
+          { label: "Turn off" },
+        ],
+        10,
+        10,
+      ),
+    );
+    const radios = screen.getAllByRole("menuitemradio");
+    expect(radios.map((item) => [item.textContent, item.getAttribute("aria-checked")])).toEqual([
+      ["15 minutes", "false"],
+      ["30 minutes", "true"],
+    ]);
+    // Plain actions stay ordinary menu items.
+    expect(screen.getByRole("menuitem").textContent).toBe("Turn off");
+    fireEvent.click(radios[0]);
+    expect(pick).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+});
+
 describe("track menu", () => {
   it("offers the actions from the specification, including Remove from Library", () => {
     open();

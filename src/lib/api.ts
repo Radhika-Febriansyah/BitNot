@@ -5,6 +5,7 @@ import type {
   HistoryEntry,
   Overview,
   PlaybackState,
+  SleepRequest,
   Repeat,
   ScanIssue,
   ScanSummary,
@@ -30,6 +31,7 @@ export const EVENTS = {
   libraryChanged: "library:changed",
   scanProgress: "scan:progress",
   scanFinished: "scan:finished",
+  sleepEnded: "playback:sleep-ended",
 } as const;
 
 export const api = {
@@ -106,6 +108,8 @@ export const api = {
   queueRemove: (offset: number) => invoke<PlaybackState>("queue_remove", { offset }),
   queueClear: () => invoke<PlaybackState>("queue_clear"),
   queuePlay: (offset: number) => invoke<PlaybackState>("queue_play", { offset }),
+  sleepSet: (request: SleepRequest) => invoke<PlaybackState>("sleep_set", { request }),
+  sleepCancel: () => invoke<PlaybackState>("sleep_cancel"),
 
   /** Opens the Windows file picker for a cover image. Resolves to null when cancelled. */
   async pickImage(): Promise<string | null> {

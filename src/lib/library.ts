@@ -114,6 +114,18 @@ export interface TrashItem {
 
 export type Repeat = "off" | "all" | "one";
 
+/** Sleep timer lengths offered (CLAUDE.md §20); the core accepts only these. */
+export const SLEEP_MINUTES = [15, 30, 45, 60] as const;
+
+export type SleepRequest = { kind: "minutes"; minutes: number } | { kind: "endOfTrack" };
+
+export interface SleepStatus {
+  kind: "minutes" | "endOfTrack";
+  minutes: number | null;
+  /** Time left when the state was produced, for a fixed-length timer. */
+  remainingMs: number | null;
+}
+
 export interface PlaybackState {
   track: Track | null;
   nextUp: Track[];
@@ -125,12 +137,17 @@ export interface PlaybackState {
   volume: number;
   outputAvailable: boolean;
   error: string | null;
+  sleep: SleepStatus | null;
+  /** The core's monotonic time when `positionMs` was read (see playbackClock.ts). */
+  clockMs: number;
 }
 
 export interface Progress {
   trackId: number | null;
   positionMs: number;
   playing: boolean;
+  /** The core's monotonic time when `positionMs` was read. */
+  clockMs: number;
 }
 
 /** Which part of the library changed (payload of the `library:changed` event). */
@@ -157,6 +174,8 @@ export const EMPTY_PLAYBACK: PlaybackState = {
   volume: 80,
   outputAvailable: true,
   error: null,
+  sleep: null,
+  clockMs: 0,
 };
 
 export const kindLabel = (kind: CollectionKind) => t(`kind.${kind}`);

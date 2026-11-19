@@ -11,7 +11,7 @@ export type LibraryFilter =
   | "online";
 
 const FILTERS: LibraryFilter[] = ["all", "playlists", "albums", "artists", "local", "recent", "online"];
-const PLAIN_PAGES = ["home", "explore", "search", "favorites", "recent", "settings"] as const;
+const PLAIN_PAGES = ["home", "explore", "search", "favorites", "recent", "nowPlaying", "settings"] as const;
 
 export type Route =
   | { page: "home" }
@@ -21,6 +21,7 @@ export type Route =
   | { page: "favorites" }
   | { page: "recent" }
   | { page: "collection"; id: string }
+  | { page: "nowPlaying" }
   | { page: "settings" };
 
 export interface NavState {

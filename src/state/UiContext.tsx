@@ -38,6 +38,8 @@ export type MenuItem =
       children?: MenuItem[];
       danger?: boolean;
       disabled?: boolean;
+      /** Set (true or false) for one of a group of choices; shown with a check. */
+      checked?: boolean;
     };
 
 interface MenuState {
@@ -157,7 +159,8 @@ function Menu({ state, onClose }: { state: MenuState; onClose: () => void }) {
           <button
             key={index}
             className={item.danger ? "menu-item danger" : "menu-item"}
-            role="menuitem"
+            role={item.checked === undefined ? "menuitem" : "menuitemradio"}
+            aria-checked={item.checked}
             aria-haspopup={item.children ? "menu" : undefined}
             disabled={item.disabled}
             onClick={() => {
@@ -170,6 +173,11 @@ function Menu({ state, onClose }: { state: MenuState; onClose: () => void }) {
             }}
           >
             <span className="menu-label truncate">{item.label}</span>
+            {item.checked && (
+              <span className="menu-check">
+                <Icon name="check" size={1} />
+              </span>
+            )}
             {item.children && <Icon name="chevron-right" size={1} />}
           </button>
         ),

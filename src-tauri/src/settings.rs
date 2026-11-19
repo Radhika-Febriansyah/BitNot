@@ -44,6 +44,16 @@ pub enum LibraryView {
     List,
 }
 
+/// The two Now Playing layouts (CLAUDE.md §6).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NowPlayingLayout {
+    /// Large artwork in the middle, details and controls below it.
+    Centered,
+    /// Artwork on the left, details, controls, and Next Up on the right.
+    Split,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct Settings {
@@ -69,6 +79,7 @@ pub struct Settings {
     pub queue_panel_open: bool,
     pub sidebar_collapsed: bool,
     pub guide_dismissed: bool,
+    pub now_playing_layout: NowPlayingLayout,
 }
 
 impl Default for Settings {
@@ -88,6 +99,7 @@ impl Default for Settings {
             queue_panel_open: true,
             sidebar_collapsed: false,
             guide_dismissed: false,
+            now_playing_layout: NowPlayingLayout::Centered,
         }
     }
 }
@@ -333,6 +345,26 @@ mod tests {
         assert_eq!(s.library_view, LibraryView::List);
         assert!(apply_patch(&conn, &patch(json!({"libraryView": "table"})), 1).is_err());
         assert!(apply_patch(&conn, &patch(json!({"lastPage": "x".repeat(601)})), 1).is_err());
+    }
+
+    #[test]
+    fn now_playing_layout_defaults_to_centered_and_accepts_split_only() {
+        let conn = conn();
+        assert_eq!(
+            load(&conn).unwrap().now_playing_layout,
+            NowPlayingLayout::Centered
+        );
+        let s = apply_patch(&conn, &patch(json!({"nowPlayingLayout": "split"})), 1).unwrap();
+        assert_eq!(s.now_playing_layout, NowPlayingLayout::Split);
+        assert_eq!(
+            load(&conn).unwrap().now_playing_layout,
+            NowPlayingLayout::Split
+        );
+        assert!(apply_patch(&conn, &patch(json!({"nowPlayingLayout": "grid"})), 1).is_err());
+        assert_eq!(
+            load(&conn).unwrap().now_playing_layout,
+            NowPlayingLayout::Split
+        );
     }
 
     #[test]

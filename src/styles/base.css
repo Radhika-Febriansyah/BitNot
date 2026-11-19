@@ -495,3 +495,11 @@ dialog.dialog::backdrop {
   min-width: 0;
   text-align: left;
 }
+
+/* A checked choice in a menu (e.g. the sleep timer length). */
+.menu-check {
+  display: grid;
+  place-items: center;
+  margin-left: auto;
+  color: var(--accent-text);
+}

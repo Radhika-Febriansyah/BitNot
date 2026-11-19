@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Collection } from "../pages/Collection";
 import { Home } from "../pages/Home";
 import { Library } from "../pages/Library";
+import { NowPlaying } from "../pages/NowPlaying";
 import { Settings } from "../pages/Settings";
 import { Explore, Favorites, RecentlyPlayed, Search } from "../pages/SimplePages";
 import type { Route } from "../lib/router";
@@ -9,6 +10,9 @@ import { NARROW_QUERY, useMediaQuery } from "../lib/useMediaQuery";
 import { useApp } from "../state/AppContext";
 import { useLibrary } from "../state/LibraryContext";
 import { UiProvider } from "../state/UiContext";
+import { SEEK_STEP_MS, VOLUME_STEP } from "../lib/shortcuts";
+import { useShortcuts } from "../lib/useShortcuts";
+import { ShortcutsDialog } from "./ShortcutsDialog";
 import { PlayerBar } from "./PlayerBar";
 import { QueuePanel } from "./QueuePanel";
 import { Sidebar } from "./Sidebar";
@@ -26,7 +30,27 @@ function routeKey(route: Route): string {
 /** The four regions of the reference: sidebar, centre column, queue, player bar. */
 export function Shell() {
   const { route, settings, updateSettings, notify } = useApp();
-  const { playback } = useLibrary();
+  const library = useLibrary();
+  const { playback } = library;
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const canPlay = playback.outputAvailable && (playback.track !== null || playback.nextUp.length > 0);
+
+  useShortcuts({
+    togglePlay: () => canPlay && library.toggle(),
+    next: () => canPlay && library.next(),
+    previous: () => canPlay && library.previous(),
+    seekForward: () => library.seekBy(SEEK_STEP_MS),
+    seekBack: () => library.seekBy(-SEEK_STEP_MS),
+    volumeUp: () => library.setVolume(library.volume + VOLUME_STEP),
+    volumeDown: () => library.setVolume(library.volume - VOLUME_STEP),
+    mute: library.toggleMute,
+    search: () => {
+      const input = document.querySelector<HTMLInputElement>(".top-search input");
+      input?.focus();
+      input?.select();
+    },
+    help: () => setShortcutsOpen(true),
+  });
   const narrow = useMediaQuery(NARROW_QUERY);
   const queueOverlay = useMediaQuery(QUEUE_OVERLAY_QUERY);
   const rail = narrow || settings.sidebarCollapsed;
@@ -70,6 +94,8 @@ export function Shell() {
         return <RecentlyPlayed />;
       case "collection":
         return <Collection key={route.id} id={route.id} />;
+      case "nowPlaying":
+        return <NowPlaying />;
       case "settings":
         return <Settings />;
     }
@@ -90,6 +116,7 @@ export function Shell() {
         {queueOpen && <QueuePanel onClose={toggleQueue} overlay={queueOverlay} />}
         <PlayerBar queueOpen={queueOpen} onToggleQueue={toggleQueue} />
       </div>
+      <ShortcutsDialog open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
     </UiProvider>
   );
 }

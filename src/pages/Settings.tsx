@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { AccentPicker, ThemePicker } from "../components/AppearanceControls";
 import { ConfirmDialog, Dialog, PromptDialog } from "../components/Dialog";
+import { ShortcutList } from "../components/ShortcutsDialog";
 import { Icon } from "../components/Icon";
 import { api, errorMessage } from "../lib/api";
 import { folderCountText } from "../lib/folders";
@@ -65,6 +66,21 @@ function Appearance() {
             </option>
           ))}
         </select>
+      </Row>
+      <Row label={t("nowPlaying.layout")} hint={t("nowPlaying.layoutHint")}>
+        <div className="chip-row" role="radiogroup" aria-label={t("nowPlaying.layout")}>
+          {(["centered", "split"] as const).map((layout) => (
+            <button
+              key={layout}
+              className="chip"
+              role="radio"
+              aria-checked={settings.nowPlayingLayout === layout}
+              onClick={() => void updateSettings({ nowPlayingLayout: layout })}
+            >
+              {t(layout === "centered" ? "nowPlaying.centered" : "nowPlaying.split")}
+            </button>
+          ))}
+        </div>
       </Row>
       <Row label="Motion" hint="Reduce motion turns off transitions and animations.">
         <div className="chip-row" role="radiogroup" aria-label="Motion">
@@ -537,6 +553,12 @@ export function Settings() {
     <div className="page settings">
       <h1>Settings</h1>
       <Appearance />
+      <Section id="shortcuts-title" title={t("shortcuts.title")}>
+        <p className="section-note">
+          {t("shortcuts.note")} {t("shortcuts.settingsHint")}
+        </p>
+        <ShortcutList />
+      </Section>
       <MusicFolders />
       <Profiles />
       <RecycleBin />

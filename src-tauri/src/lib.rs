@@ -11,8 +11,10 @@ mod paths;
 mod playback;
 mod profiles;
 mod queue;
+mod resample;
 mod scanner;
 mod settings;
+mod sleep;
 mod textfold;
 mod watcher;
 
@@ -36,6 +38,8 @@ use crate::settings::Settings;
 
 const EVENT_PROGRESS: &str = "playback:progress";
 const EVENT_PLAYBACK_CHANGED: &str = "playback:changed";
+/// The sleep timer paused playback (or ran out while it was paused).
+const EVENT_SLEEP_ENDED: &str = "playback:sleep-ended";
 /// Payload: which part of the library changed, so views reload only what they show.
 const EVENT_LIBRARY_CHANGED: &str = "library:changed";
 const EVENT_SCAN_PROGRESS: &str = "scan:progress";
@@ -438,6 +442,16 @@ fn playback_previous(app: AppHandle, state: State<'_, Managed>) -> Result<Playba
 }
 
 #[tauri::command(async)]
+fn sleep_set(state: State<'_, Managed>, request: sleep::SleepRequest) -> Result<PlaybackState> {
+    core_of(&state)?.sleep_set(request)
+}
+
+#[tauri::command(async)]
+fn sleep_cancel(state: State<'_, Managed>) -> Result<PlaybackState> {
+    core_of(&state)?.sleep_cancel()
+}
+
+#[tauri::command(async)]
 fn playback_seek(state: State<'_, Managed>, position_ms: u64) -> Result<PlaybackState> {
     core_of(&state)?.seek(position_ms)
 }
@@ -500,12 +514,15 @@ fn spawn_ticker(app: AppHandle, core: Arc<AppCore>) {
             let mut was_playing = false;
             loop {
                 std::thread::sleep(TICK);
-                let Ok((track_changed, progress)) = core.tick() else {
+                let Ok((tick, progress)) = core.tick() else {
                     continue;
                 };
-                if track_changed {
+                if tick.changed {
                     playback_changed(&app);
                     changed(&app, &[SCOPE_HISTORY]);
+                }
+                if tick.slept {
+                    let _ = app.emit(EVENT_SLEEP_ENDED, ());
                 }
                 if progress.playing || was_playing {
                     let _ = app.emit(EVENT_PROGRESS, progress);
@@ -671,6 +688,8 @@ pub fn run() {
             queue_remove,
             queue_clear,
             queue_play,
+            sleep_set,
+            sleep_cancel,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the BitNot application");

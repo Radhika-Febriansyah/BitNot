@@ -7,8 +7,8 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{mpsc, OnceLock};
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 use serde::Serialize;
@@ -16,10 +16,24 @@ use serde::Serialize;
 use crate::error::{AppError, Result};
 use crate::library::{self, Track};
 use crate::queue::{Queue, Repeat};
+use crate::resample::{Marked, OutputStage, TrackStarts};
+use crate::sleep::{SleepRequest, SleepStatus, SleepTimer};
 
 const NEXT_UP_LIMIT: usize = 100;
 /// Pressing Previous later than this restarts the current track instead.
 const RESTART_THRESHOLD: Duration = Duration::from_secs(3);
+
+/// Milliseconds on the core's monotonic clock: time since the first reading in
+/// this process. Progress readings carry it so the interface can tell how old a
+/// reading is and estimate the position between readings (see
+/// `src/lib/playbackClock.ts`). Wall-clock time is not used, so changing the
+/// Windows clock cannot disturb it.
+pub fn monotonic_ms(at: Instant) -> u64 {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    // The real time of the first use, never a caller's (possibly future) instant.
+    let origin = *ORIGIN.get_or_init(Instant::now);
+    at.saturating_duration_since(origin).as_millis() as u64
+}
 
 /// What the controller needs from an audio output.
 pub trait Output: Send {
@@ -45,9 +59,27 @@ pub trait Output: Send {
 /// the process.
 pub struct DeviceOutput {
     player: rodio::Player,
+    /// Shared with the output stage so it knows where each track begins.
+    starts: std::sync::Arc<TrackStarts>,
 }
 
 impl DeviceOutput {
+    /// Connects a Player to `mixer` through the output stage (resample.rs),
+    /// which hands the mixer stereo at `rate`: the mixer's own rate. The
+    /// mixer therefore never converts the rate (rodio's converter is low
+    /// quality) and never sees the empty queue's mono format, which made the
+    /// first track after start-up play its first 10 ms wrongly.
+    pub fn on_mixer(mixer: &rodio::mixer::Mixer, rate: std::num::NonZero<u32>) -> Self {
+        let (player, queue) = rodio::Player::new();
+        let starts = std::sync::Arc::new(TrackStarts::default());
+        mixer.add(OutputStage::new(
+            queue,
+            rate,
+            std::sync::Arc::clone(&starts),
+        ));
+        DeviceOutput { player, starts }
+    }
+
     pub fn open() -> std::result::Result<Self, String> {
         let (sender, receiver) = mpsc::channel();
         std::thread::Builder::new()
@@ -56,8 +88,16 @@ impl DeviceOutput {
                 move || match rodio::DeviceSinkBuilder::open_default_sink() {
                     Ok(mut sink) => {
                         sink.log_on_drop(false);
-                        let player = rodio::Player::connect_new(sink.mixer());
-                        if sender.send(Ok(player)).is_ok() {
+                        // The rate of the stream actually opened, not an assumption.
+                        let config = sink.config();
+                        log::info!(
+                            "audio output: {} Hz, {} channels, {:?}",
+                            config.sample_rate(),
+                            config.channel_count(),
+                            config.sample_format()
+                        );
+                        let output = DeviceOutput::on_mixer(sink.mixer(), config.sample_rate());
+                        if sender.send(Ok(output)).is_ok() {
                             // Keep the device stream alive.
                             loop {
                                 std::thread::park();
@@ -70,10 +110,9 @@ impl DeviceOutput {
                 },
             )
             .map_err(|e| e.to_string())?;
-        let player = receiver
+        receiver
             .recv_timeout(Duration::from_secs(10))
-            .map_err(|_| "The audio device did not respond.".to_string())??;
-        Ok(DeviceOutput { player })
+            .map_err(|_| "The audio device did not respond.".to_string())?
     }
 }
 
@@ -97,7 +136,7 @@ impl Output for DeviceOutput {
             .build()
             .map_err(|_| "This file could not be decoded.".to_string())?;
         self.player.stop();
-        self.player.append(source);
+        self.player.append(Marked::new(source, &self.starts));
         if !start.is_zero() {
             // A failed seek leaves playback at the start, which is acceptable.
             let _ = self.player.try_seek(start);
@@ -158,6 +197,19 @@ pub struct PlaybackState {
     pub output_available: bool,
     /// Why the last track could not be played, if it could not.
     pub error: Option<String>,
+    /// The armed sleep timer, if any.
+    pub sleep: Option<SleepStatus>,
+    /// When `position_ms` was read, on the monotonic clock ([`monotonic_ms`]).
+    pub clock_ms: u64,
+}
+
+/// What one tick of the ticker did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tick {
+    /// The track, queue, or playing state changed.
+    pub changed: bool,
+    /// The sleep timer stopped playback (or ran out while paused).
+    pub slept: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
@@ -166,6 +218,8 @@ pub struct Progress {
     pub track_id: Option<i64>,
     pub position_ms: u64,
     pub playing: bool,
+    /// When `position_ms` was read, on the monotonic clock ([`monotonic_ms`]).
+    pub clock_ms: u64,
 }
 
 /// Saved between sessions so the queue can be restored.
@@ -188,6 +242,7 @@ pub struct Controller {
     seed: u64,
     /// The queue as last written to the database, to skip identical writes.
     saved_queue: String,
+    sleep: SleepTimer,
 }
 
 fn linear_volume(percent: u32) -> f32 {
@@ -208,6 +263,7 @@ impl Controller {
             error: None,
             seed: 0x9E37_79B9_7F4A_7C15,
             saved_queue: String::new(),
+            sleep: SleepTimer::default(),
         };
         if let Some(output) = controller.output.as_mut() {
             output.set_volume(linear_volume(controller.volume));
@@ -423,38 +479,97 @@ impl Controller {
     }
 
     /// Stops playback and empties the queue (used when switching profile).
+    /// A sleep timer belongs to what was playing, so it is cancelled too.
     pub fn reset(&mut self) {
         self.halt();
         self.queue.clear();
         self.error = None;
+        self.sleep.cancel();
     }
 
-    /// Called a few times a second. Moves on when a track ends.
-    /// Returns true when the track or queue changed.
+    /// Arms the sleep timer. Stopping after the current track needs a track.
+    pub fn set_sleep(&mut self, request: SleepRequest, at: Instant) -> Result<()> {
+        if request == SleepRequest::EndOfTrack && self.queue.current_track().is_none() {
+            return Err(AppError::invalid(
+                "Nothing is playing, so there is no track to stop after.",
+            ));
+        }
+        self.sleep.set(request, at)
+    }
+
+    pub fn cancel_sleep(&mut self) {
+        self.sleep.cancel();
+    }
+
+    /// [`Self::tick_at`] with the current monotonic time; used by tests.
+    #[cfg(test)]
     pub fn tick(&mut self, conn: &Connection, now: i64) -> Result<bool> {
+        Ok(self.tick_at(conn, now, Instant::now())?.changed)
+    }
+
+    /// One tick. `now` is wall-clock time for play history; `at` is the
+    /// monotonic time the sleep timer is measured against.
+    pub fn tick_at(&mut self, conn: &Connection, now: i64, at: Instant) -> Result<Tick> {
+        if self.sleep.take_expired(at) {
+            // Paused, not stopped: the track and position stay where they are.
+            if self.playing {
+                if let Some(output) = self.output.as_mut() {
+                    output.pause();
+                }
+                self.playing = false;
+            }
+            return Ok(Tick {
+                changed: true,
+                slept: true,
+            });
+        }
         let ended = self.playing
             && self.loaded.is_some()
             && self.output.as_ref().is_some_and(|o| o.finished());
         if !ended {
-            return Ok(false);
+            return Ok(Tick::default());
+        }
+        if self.sleep.take_end_of_track() {
+            // Stop instead of starting the next track. The queue still moves on
+            // (following repeat and shuffle), so Play continues with the track
+            // that would have come next; at the end of the queue it stays put.
+            self.queue.advance(true);
+            self.halt();
+            return Ok(Tick {
+                changed: true,
+                slept: true,
+            });
         }
         if self.queue.advance(true).is_some() {
             self.start_current(conn, now, 0)?;
         } else {
             self.halt();
         }
-        Ok(true)
+        Ok(Tick {
+            changed: true,
+            slept: false,
+        })
     }
 
     pub fn progress(&self) -> Progress {
+        self.progress_at(Instant::now())
+    }
+
+    /// The position, dated: read at `at` on the monotonic clock.
+    pub fn progress_at(&self, at: Instant) -> Progress {
         Progress {
             track_id: self.queue.current_track(),
             position_ms: self.position_ms(),
             playing: self.playing,
+            clock_ms: monotonic_ms(at),
         }
     }
 
     pub fn state(&self, conn: &Connection) -> Result<PlaybackState> {
+        self.state_at(conn, Instant::now())
+    }
+
+    pub fn state_at(&self, conn: &Connection, at: Instant) -> Result<PlaybackState> {
         let upcoming = self.queue.upcoming();
         let shown = &upcoming[..upcoming.len().min(NEXT_UP_LIMIT)];
         Ok(PlaybackState {
@@ -471,6 +586,8 @@ impl Controller {
             volume: self.volume,
             output_available: self.output.is_some(),
             error: self.error.clone(),
+            sleep: self.sleep.status(at),
+            clock_ms: monotonic_ms(at),
         })
     }
 
@@ -523,6 +640,8 @@ impl Controller {
     pub fn restore(&mut self, conn: &Connection) -> Result<()> {
         self.halt();
         self.queue.clear();
+        // A sleep timer is never carried over (see sleep.rs).
+        self.sleep.cancel();
         let raw: Option<String> = {
             use rusqlite::OptionalExtension;
             conn.query_row("SELECT data FROM queue_state WHERE id = 1", [], |row| {
@@ -699,6 +818,41 @@ mod tests {
         assert!((fake.0.lock().unwrap().volume - 0.25).abs() < 1e-6);
         c.set_volume(500);
         assert_eq!(c.state(&conn).unwrap().volume, 100);
+    }
+
+    #[test]
+    fn readings_are_dated_on_the_monotonic_clock() {
+        let (conn, ids, fake, mut c) = setup();
+        c.play_tracks(&conn, ids, 0, 1).unwrap();
+        monotonic_ms(Instant::now()); // the origin is set before t0
+        let t0 = Instant::now();
+        fake.0.lock().unwrap().position = Duration::from_millis(1_500);
+        let first = c.progress_at(t0);
+        let later = c.progress_at(t0 + Duration::from_millis(250));
+        assert_eq!(later.clock_ms - first.clock_ms, 250);
+        assert_eq!(first.position_ms, 1_500);
+        assert!(first.playing);
+
+        // The full state is dated on the same clock, so either can be compared.
+        let state = c.state_at(&conn, t0 + Duration::from_millis(400)).unwrap();
+        assert_eq!(state.clock_ms - first.clock_ms, 400);
+
+        // Paused, stopped, and track changes are all visible in a reading.
+        c.toggle(&conn, 2).unwrap();
+        assert!(!c.progress_at(t0).playing);
+        c.next(&conn, 3).unwrap();
+        let next = c.progress_at(t0);
+        assert!(next.playing);
+        assert_ne!(next.track_id, first.track_id);
+        c.reset();
+        let stopped = c.progress_at(t0);
+        assert!(!stopped.playing);
+        assert_eq!((stopped.track_id, stopped.position_ms), (None, 0));
+
+        // Never earlier than the clock's origin, and serialised for the window.
+        assert_eq!(monotonic_ms(t0 - Duration::from_secs(3600)), 0);
+        let json = serde_json::to_value(c.progress_at(t0)).unwrap();
+        assert!(json["clockMs"].is_u64());
     }
 
     #[test]
@@ -917,5 +1071,533 @@ mod tests {
         assert!(state.track.is_none());
         assert_eq!(state.position_ms, 0);
         assert_eq!(state.next_up.len(), 2);
+    }
+
+    // ── Sleep timer ───────────────────────────────────────────────────────
+
+    mod sleep_timer {
+        use super::*;
+        use crate::sleep::{SleepKind, SleepRequest, PRESET_MINUTES};
+
+        const MIN: Duration = Duration::from_secs(60);
+
+        fn minutes(minutes: u32) -> SleepRequest {
+            SleepRequest::Minutes { minutes }
+        }
+
+        fn paused(fake: &Fake) -> bool {
+            fake.0.lock().unwrap().paused
+        }
+
+        fn finish_track(fake: &Fake) {
+            fake.0.lock().unwrap().finished = true;
+        }
+
+        #[test]
+        fn each_length_pauses_at_its_end_time_and_keeps_the_place() {
+            for preset in PRESET_MINUTES {
+                let (conn, ids, fake, mut c) = setup();
+                c.play_tracks(&conn, ids.clone(), 0, 1).unwrap();
+                c.seek(42_000).unwrap();
+                let t0 = Instant::now();
+                c.set_sleep(minutes(preset), t0).unwrap();
+                let end = t0 + MIN * preset;
+
+                let early = c.tick_at(&conn, 2, end - Duration::from_millis(1)).unwrap();
+                assert_eq!(early, Tick::default(), "{preset} min fired early");
+                assert!(c.state(&conn).unwrap().playing);
+
+                let fired = c.tick_at(&conn, 3, end).unwrap();
+                assert!(fired.changed && fired.slept, "{preset} min did not fire");
+                let state = c.state_at(&conn, end).unwrap();
+                assert!(!state.playing);
+                assert!(paused(&fake));
+                assert_eq!(state.track.unwrap().title, "One");
+                assert_eq!(state.position_ms, 42_000);
+                assert_eq!(state.sleep, None);
+            }
+        }
+
+        #[test]
+        fn it_stops_playback_only_once() {
+            let (conn, ids, fake, mut c) = setup();
+            c.play_tracks(&conn, ids, 0, 1).unwrap();
+            let t0 = Instant::now();
+            c.set_sleep(minutes(15), t0).unwrap();
+            assert!(c.tick_at(&conn, 2, t0 + MIN * 15).unwrap().slept);
+            // Music started again afterwards keeps playing.
+            c.toggle(&conn, 3).unwrap();
+            for later in [16, 30, 600] {
+                assert_eq!(
+                    c.tick_at(&conn, 4, t0 + MIN * later).unwrap(),
+                    Tick::default()
+                );
+            }
+            assert!(c.state(&conn).unwrap().playing);
+            assert!(!paused(&fake));
+        }
+
+        #[test]
+        fn wall_clock_changes_do_not_move_it() {
+            let (conn, ids, _fake, mut c) = setup();
+            c.play_tracks(&conn, ids, 0, 1_700_000_000).unwrap();
+            let t0 = Instant::now();
+            c.set_sleep(minutes(30), t0).unwrap();
+            // The Windows clock jumps a day ahead, then a year back; the
+            // monotonic time has only moved ten minutes.
+            for wall in [1_700_086_400, 1_668_000_000, 0, -1] {
+                assert!(!c.tick_at(&conn, wall, t0 + MIN * 10).unwrap().slept);
+            }
+            assert_eq!(
+                c.state_at(&conn, t0 + MIN * 10)
+                    .unwrap()
+                    .sleep
+                    .unwrap()
+                    .remaining_ms,
+                Some(20 * 60_000)
+            );
+            assert!(
+                c.tick_at(&conn, 1_668_000_000, t0 + MIN * 30)
+                    .unwrap()
+                    .slept
+            );
+        }
+
+        #[test]
+        fn it_counts_real_time_through_a_pause() {
+            let (conn, ids, fake, mut c) = setup();
+            c.play_tracks(&conn, ids, 0, 1).unwrap();
+            let t0 = Instant::now();
+            c.set_sleep(minutes(15), t0).unwrap();
+            c.toggle(&conn, 2).unwrap(); // pause
+            c.toggle(&conn, 3).unwrap(); // resume
+            assert!(!c.tick_at(&conn, 4, t0 + MIN * 14).unwrap().slept);
+            assert!(c.state(&conn).unwrap().playing);
+
+            // Paused when the time runs out: it is used up, and nothing else changes.
+            c.toggle(&conn, 5).unwrap();
+            let fired = c.tick_at(&conn, 6, t0 + MIN * 20).unwrap();
+            assert!(fired.slept);
+            let state = c.state(&conn).unwrap();
+            assert!(!state.playing && state.sleep.is_none());
+            assert_eq!(state.track.unwrap().title, "One");
+            c.toggle(&conn, 7).unwrap();
+            assert!(c.state(&conn).unwrap().playing);
+            assert!(!paused(&fake));
+        }
+
+        #[test]
+        fn cancelling_keeps_the_music_playing() {
+            let (conn, ids, _fake, mut c) = setup();
+            c.play_tracks(&conn, ids, 0, 1).unwrap();
+            let t0 = Instant::now();
+            c.set_sleep(minutes(45), t0).unwrap();
+            c.cancel_sleep();
+            assert_eq!(c.state(&conn).unwrap().sleep, None);
+            assert_eq!(c.tick_at(&conn, 2, t0 + MIN * 90).unwrap(), Tick::default());
+            assert!(c.state(&conn).unwrap().playing);
+        }
+
+        #[test]
+        fn seeking_and_skipping_do_not_change_a_fixed_length_timer() {
+            let (conn, ids, _fake, mut c) = setup();
+            c.play_tracks(&conn, ids, 0, 1).unwrap();
+            let t0 = Instant::now();
+            c.set_sleep(minutes(60), t0).unwrap();
+            c.seek(170_000).unwrap();
+            c.next(&conn, 2).unwrap();
+            c.previous(&conn, 3).unwrap();
+            let state = c.state_at(&conn, t0 + MIN * 5).unwrap();
+            assert_eq!(state.sleep.unwrap().remaining_ms, Some(55 * 60_000));
+            assert!(c.tick_at(&conn, 4, t0 + MIN * 60).unwrap().slept);
+        }
+
+        #[test]
+        fn end_of_track_finishes_the_song_and_does_not_start_the_next() {
+            let (conn, ids, fake, mut c) = setup();
+            c.play_tracks(&conn, ids, 0, 1).unwrap();
+            let t0 = Instant::now();
+            c.set_sleep(SleepRequest::EndOfTrack, t0).unwrap();
+            assert_eq!(
+                c.state(&conn).unwrap().sleep.unwrap().kind,
+                SleepKind::EndOfTrack
+            );
+
+            // Time alone never ends it, and neither does a seek.
+            c.seek(150_000).unwrap();
+            assert_eq!(
+                c.tick_at(&conn, 2, t0 + MIN * 600).unwrap(),
+                Tick::default()
+            );
+            assert!(c.state(&conn).unwrap().playing);
+
+            finish_track(&fake);
+            let fired = c.tick_at(&conn, 3, t0 + MIN * 601).unwrap();
+            assert!(fired.changed && fired.slept);
+            let state = c.state(&conn).unwrap();
+            assert!(!state.playing);
+            assert_eq!(state.sleep, None);
+            assert!(
+                fake.0.lock().unwrap().loaded.is_none(),
+                "nothing new was loaded"
+            );
+            // The queue is ready on the next song, which was not played or counted.
+            let next = state.track.unwrap();
+            assert_eq!(next.title, "Two");
+            assert_eq!(next.play_count, 0);
+            assert_eq!(state.position_ms, 0);
+            assert_eq!(
+                c.tick_at(&conn, 4, t0 + MIN * 602).unwrap(),
+                Tick::default()
+            );
+
+            // Play continues from there.
+            c.toggle(&conn, 5).unwrap();
+            let state = c.state(&conn).unwrap();
+            assert!(state.playing);
+            assert_eq!(state.track.unwrap().title, "Two");
+        }
+
+        #[test]
+        fn end_of_track_follows_repeat_and_shuffle() {
+            // Repeat One: the same song is ready again, not restarted.
+            let (conn, ids, fake, mut c) = setup();
+            c.play_tracks(&conn, ids.clone(), 1, 1).unwrap();
+            c.set_repeat(Repeat::One);
+            c.set_sleep(SleepRequest::EndOfTrack, Instant::now())
+                .unwrap();
+            finish_track(&fake);
+            assert!(c.tick_at(&conn, 2, Instant::now()).unwrap().slept);
+            let state = c.state(&conn).unwrap();
+            assert!(!state.playing);
+            assert_eq!(state.track.unwrap().title, "Two");
+            assert!(fake.0.lock().unwrap().loaded.is_none());
+
+            // Repeat All on the last song: it would wrap, so the first is ready.
+            let (conn, ids, fake, mut c) = setup();
+            c.play_tracks(&conn, ids.clone(), 2, 1).unwrap();
+            c.set_repeat(Repeat::All);
+            c.set_sleep(SleepRequest::EndOfTrack, Instant::now())
+                .unwrap();
+            finish_track(&fake);
+            assert!(c.tick_at(&conn, 2, Instant::now()).unwrap().slept);
+            let state = c.state(&conn).unwrap();
+            assert!(!state.playing);
+            assert_eq!(state.track.unwrap().title, "One");
+
+            // Repeat off on the last song: playback ends there as it normally would.
+            let (conn, ids, fake, mut c) = setup();
+            c.play_tracks(&conn, ids.clone(), 2, 1).unwrap();
+            c.set_sleep(SleepRequest::EndOfTrack, Instant::now())
+                .unwrap();
+            finish_track(&fake);
+            assert!(c.tick_at(&conn, 2, Instant::now()).unwrap().slept);
+            let state = c.state(&conn).unwrap();
+            assert!(!state.playing);
+            assert_eq!(state.track.unwrap().title, "Three");
+
+            // Shuffle: the song shuffle had lined up next is the one left ready.
+            let (conn, ids, fake, mut c) = setup();
+            c.play_tracks(&conn, ids, 0, 1).unwrap();
+            c.set_shuffle(true, 12_345);
+            let lined_up = c.state(&conn).unwrap().next_up[0].id;
+            c.set_sleep(SleepRequest::EndOfTrack, Instant::now())
+                .unwrap();
+            finish_track(&fake);
+            assert!(c.tick_at(&conn, 2, Instant::now()).unwrap().slept);
+            let state = c.state(&conn).unwrap();
+            assert!(!state.playing);
+            assert_eq!(state.track.unwrap().id, lined_up);
+            assert!(state.shuffle);
+        }
+
+        #[test]
+        fn end_of_track_applies_to_whichever_song_is_playing_when_it_ends() {
+            let (conn, ids, fake, mut c) = setup();
+            c.play_tracks(&conn, ids, 0, 1).unwrap();
+            c.set_sleep(SleepRequest::EndOfTrack, Instant::now())
+                .unwrap();
+            c.next(&conn, 2).unwrap();
+            let state = c.state(&conn).unwrap();
+            assert!(state.playing);
+            assert_eq!(state.track.unwrap().title, "Two");
+            assert!(state.sleep.is_some());
+            finish_track(&fake);
+            assert!(c.tick_at(&conn, 3, Instant::now()).unwrap().slept);
+            assert_eq!(c.state(&conn).unwrap().track.unwrap().title, "Three");
+        }
+
+        #[test]
+        fn without_a_track() {
+            let (conn, _ids, _fake, mut c) = setup();
+            assert!(c
+                .set_sleep(SleepRequest::EndOfTrack, Instant::now())
+                .is_err());
+            assert_eq!(c.state(&conn).unwrap().sleep, None);
+            // A fixed length can be set before choosing music; running out with
+            // nothing playing changes nothing.
+            let t0 = Instant::now();
+            c.set_sleep(minutes(15), t0).unwrap();
+            let fired = c.tick_at(&conn, 2, t0 + MIN * 15).unwrap();
+            assert!(fired.slept);
+            let state = c.state(&conn).unwrap();
+            assert!(!state.playing && state.track.is_none() && state.sleep.is_none());
+
+            // No audio device: still harmless.
+            let mut silent = Controller::new(None, 80);
+            silent.set_sleep(minutes(15), t0).unwrap();
+            assert!(silent.tick_at(&conn, 2, t0 + MIN * 15).unwrap().slept);
+        }
+
+        #[test]
+        fn a_restart_or_profile_switch_does_not_carry_the_timer_over() {
+            let (conn, ids, _fake, mut c) = setup();
+            c.play_tracks(&conn, ids, 0, 1).unwrap();
+            c.set_sleep(minutes(30), Instant::now()).unwrap();
+            c.save(&conn).unwrap();
+
+            // A new session restores the queue but not the timer.
+            let mut restarted = Controller::new(Some(Box::new(Fake::default())), 80);
+            restarted.restore(&conn).unwrap();
+            let state = restarted.state(&conn).unwrap();
+            assert_eq!(state.track.unwrap().title, "One");
+            assert_eq!(state.sleep, None);
+
+            // Restoring in place (profile switch) and resetting both cancel it.
+            c.restore(&conn).unwrap();
+            assert_eq!(c.state(&conn).unwrap().sleep, None);
+            c.set_sleep(minutes(30), Instant::now()).unwrap();
+            c.reset();
+            assert_eq!(c.state(&conn).unwrap().sleep, None);
+        }
+    }
+
+    // ── The real output on an offline mixer ─────────────────────────────────
+
+    mod device_output {
+        use super::*;
+        use crate::resample::test_audio::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Instant;
+
+        const RATE: u32 = 48_000;
+
+        /// The device thread's role, played by a thread that pulls the mixer
+        /// (about ten times faster than real time) and keeps what it pulled.
+        struct Device {
+            pulled: Arc<Mutex<Vec<f32>>>,
+            stop: Arc<AtomicBool>,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+
+        impl Device {
+            fn start(mut mixed: rodio::mixer::MixerSource) -> Self {
+                let pulled = Arc::new(Mutex::new(Vec::with_capacity(RATE as usize * 2 * 30)));
+                let stop = Arc::new(AtomicBool::new(false));
+                let (p, s) = (pulled.clone(), stop.clone());
+                let thread = std::thread::spawn(move || {
+                    while !s.load(Ordering::Relaxed) {
+                        let chunk: Vec<f32> = mixed.by_ref().take(960).collect();
+                        p.lock().unwrap().extend_from_slice(&chunk);
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                });
+                Device {
+                    pulled,
+                    stop,
+                    thread: Some(thread),
+                }
+            }
+
+            fn frames(&self) -> usize {
+                self.pulled.lock().unwrap().len() / 2
+            }
+
+            /// Waits until `frames` more frames have been pulled; returns them.
+            fn next_frames(&self, frames: usize) -> Vec<f32> {
+                let from = self.frames();
+                let started = Instant::now();
+                while self.frames() < from + frames {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(10),
+                        "the mixer stopped being pulled"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                self.pulled.lock().unwrap()[from * 2..(from + frames) * 2].to_vec()
+            }
+        }
+
+        impl Drop for Device {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::Relaxed);
+                if let Some(t) = self.thread.take() {
+                    t.join().ok();
+                }
+            }
+        }
+
+        fn setup() -> (DeviceOutput, Device) {
+            let (mixer, mixed) = rodio::mixer::mixer(STEREO, nz(RATE));
+            let output = DeviceOutput::on_mixer(&mixer, nz(RATE));
+            (output, Device::start(mixed))
+        }
+
+        fn files(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+            let a = dir.join("a-44k1.wav");
+            let b = dir.join("b-48k.wav");
+            write_wav(&a, 44_100, 2, &tone(997.0, 0.5, 44_100, 0.0, 44_100 * 4));
+            write_wav(&b, 48_000, 2, &tone(440.0, 0.5, 48_000, 0.0, 48_000 * 2));
+            (a, b)
+        }
+
+        fn silent(x: &[f32]) -> bool {
+            x.iter().all(|&s| s == 0.0)
+        }
+
+        #[test]
+        fn rodio_alone_reproduces_the_start_up_defect() {
+            // The original condition: a Player connected while its queue is
+            // empty. The mixer takes the empty queue's format (mono), and the
+            // first stretch of a stereo file plays as mono at half speed.
+            let dir = tempfile::tempdir().unwrap();
+            let (_, b) = files(dir.path());
+            let (mixer, mut mixed) = rodio::mixer::mixer(STEREO, nz(RATE));
+            let player = rodio::Player::connect_new(&mixer);
+            player.append(decoder(&b));
+            let out: Vec<f32> = mixed.by_ref().take(600 * 2).collect();
+            let misread = out
+                .chunks(2)
+                .filter(|f| f[0] == f[1] && f[0] != 0.0)
+                .count();
+            assert!(
+                misread > 500,
+                "rodio no longer shows the defect ({misread} frames); recheck the fix's reason"
+            );
+        }
+
+        #[test]
+        fn the_first_track_plays_correctly_from_its_first_sample() {
+            let dir = tempfile::tempdir().unwrap();
+            let (a, b) = files(dir.path());
+            // 48 kHz: exactly the file, from sample one.
+            let (mixer, mut mixed) = rodio::mixer::mixer(STEREO, nz(RATE));
+            let mut output = DeviceOutput::on_mixer(&mixer, nz(RATE));
+            output.load(&b, Duration::ZERO, false).unwrap();
+            let want: Vec<f32> = decoder(&b).take(48_000 * 2).collect();
+            let got: Vec<f32> = mixed.by_ref().take(48_000 * 2).collect();
+            assert!(
+                got.iter()
+                    .zip(&want)
+                    .all(|(x, y)| x.to_bits() == y.to_bits()),
+                "48 kHz first track is not exact"
+            );
+
+            // 44.1 kHz: stereo at the right speed from the start.
+            let (mixer, mut mixed) = rodio::mixer::mixer(STEREO, nz(RATE));
+            let mut output = DeviceOutput::on_mixer(&mixer, nz(RATE));
+            output.load(&a, Duration::ZERO, false).unwrap();
+            let got: Vec<f32> = mixed.by_ref().take(48_000 * 2).collect();
+            let reference = ideal(997.0, 0.5, RATE, 48_000);
+            // From the first millisecond (the file itself starts abruptly).
+            let worst = max_difference(&got[96..], &reference[96..]);
+            assert!(worst < 2e-4, "44.1 kHz first track deviates by {worst:e}");
+            assert_eq!(
+                got.chunks(2)
+                    .take(600)
+                    .filter(|f| f[0] == f[1] && f[0] != 0.0)
+                    .count(),
+                0
+            );
+        }
+
+        #[test]
+        fn seek_pause_resume_stop_and_track_changes_still_work() {
+            let dir = tempfile::tempdir().unwrap();
+            let (a, b) = files(dir.path());
+            let (mut output, device) = setup();
+
+            // Play: the position follows what the device has pulled.
+            output.load(&a, Duration::ZERO, false).unwrap();
+            device.next_frames(24_000);
+            let pos = output.position().as_secs_f64();
+            let pulled = device.frames() as f64 / RATE as f64;
+            assert!(
+                (pos - pulled).abs() < 0.05,
+                "position {pos:.3} s vs {pulled:.3} s pulled"
+            );
+
+            // Seek forward, then back.
+            output.seek(Duration::from_secs(3)).unwrap();
+            device.next_frames(4_800);
+            let pos = output.position().as_secs_f64();
+            assert!(
+                (3.0..3.2).contains(&pos),
+                "after seeking to 3 s: {pos:.3} s"
+            );
+            output.seek(Duration::from_millis(500)).unwrap();
+            let after = device.next_frames(9_600);
+            let pos = output.position().as_secs_f64();
+            assert!(
+                (0.5..0.7).contains(&pos),
+                "after seeking to 0.5 s: {pos:.3} s"
+            );
+            // Still a clean tone after the seek settles.
+            assert!(worst_block_thd(&left(&after[2_400 * 2..]), RATE as f64, 997.0) < -80.0);
+
+            // Pause: silence, position held; resume: sound again.
+            output.pause();
+            device.next_frames(2_400);
+            let held = output.position();
+            assert!(silent(&device.next_frames(9_600)), "audio while paused");
+            assert_eq!(output.position(), held);
+            output.play();
+            device.next_frames(2_400);
+            assert!(
+                !silent(&device.next_frames(4_800)),
+                "no audio after resuming"
+            );
+            assert!(output.position() > held);
+
+            // Change to a 48 kHz track: plays exactly once the switch is done.
+            output.load(&b, Duration::ZERO, false).unwrap();
+            let got = device.next_frames(24_000);
+            let want: Vec<f32> = decoder(&b).collect();
+            let probe = &want[4_800 * 2..4_800 * 2 + 64];
+            assert!(
+                got.windows(64)
+                    .any(|w| w.iter().zip(probe).all(|(x, y)| x.to_bits() == y.to_bits())),
+                "the 48 kHz track is not passed through exactly"
+            );
+
+            // It ends: the output reports it.
+            let started = Instant::now();
+            while !output.finished() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "never finished"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+
+            // Load paused at an offset, then play; stop silences it.
+            output.load(&a, Duration::from_millis(1_500), true).unwrap();
+            device.next_frames(2_400);
+            assert!(
+                silent(&device.next_frames(4_800)),
+                "audio while loaded paused"
+            );
+            let pos = output.position().as_secs_f64();
+            assert!(
+                (1.45..1.6).contains(&pos),
+                "loaded at 1.5 s, reports {pos:.3} s"
+            );
+            output.play();
+            device.next_frames(2_400);
+            assert!(!silent(&device.next_frames(4_800)));
+            output.stop();
+            device.next_frames(4_800);
+            assert!(silent(&device.next_frames(4_800)), "audio after stop");
+        }
     }
 }

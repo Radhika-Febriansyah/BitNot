@@ -2,6 +2,7 @@
 
 export type Theme = "dark" | "light" | "system";
 export type MotionPreference = "system" | "reduce" | "full";
+export type NowPlayingLayout = "centered" | "split";
 
 export interface Settings {
   language: string;
@@ -19,6 +20,7 @@ export interface Settings {
   queuePanelOpen: boolean;
   sidebarCollapsed: boolean;
   guideDismissed: boolean;
+  nowPlayingLayout: NowPlayingLayout;
 }
 
 export interface Profile {

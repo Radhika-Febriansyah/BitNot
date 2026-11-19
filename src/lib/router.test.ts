@@ -72,6 +72,7 @@ describe("saved routes", () => {
     const routes = [
       { page: "home" },
       { page: "settings" },
+      { page: "nowPlaying" },
       { page: "library", filter: "recent" },
       { page: "collection", id: "album:Mira\u001fLow Tide" },
     ] as const;

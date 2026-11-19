@@ -127,11 +127,19 @@ export function AppProvider({ boot, onBoot, children }: ProviderProps) {
 
   // Remember the current page. Written a moment after navigation settles, and
   // directly to the core so it does not re-render the app.
+  // Compared with what was last written, not with the value loaded at start:
+  // the loaded value goes stale once this writes, so returning to that page
+  // (for example Now Playing → artist → Now Playing) would otherwise be lost.
   const page = serializeRoute(currentRoute(nav));
   const setupComplete = boot.setupComplete;
+  const savedPage = useRef({ profile: boot.activeProfileId, page: boot.settings.lastPage });
+  if (savedPage.current.profile !== boot.activeProfileId) {
+    savedPage.current = { profile: boot.activeProfileId, page: boot.settings.lastPage };
+  }
   useEffect(() => {
-    if (!setupComplete || page === bootRef.current.settings.lastPage) return;
+    if (!setupComplete || page === savedPage.current.page) return;
     const timer = window.setTimeout(() => {
+      savedPage.current = { ...savedPage.current, page };
       api.updateSettings({ lastPage: page }).catch(() => undefined);
     }, 600);
     return () => window.clearTimeout(timer);

@@ -23,9 +23,11 @@ import {
   type Repeat,
   type ScanSummary,
   type Scope,
+  type SleepRequest,
   type Track,
   type TrackEdit,
 } from "../lib/library";
+import { PlaybackClock, type ClockReading } from "../lib/playbackClock";
 import { useApp } from "./AppContext";
 
 interface ScanStatus {
@@ -48,6 +50,11 @@ interface LibraryContextValue {
   scan: ScanStatus;
   /** Live volume (0–100), updated immediately while the slider moves. */
   volume: number;
+  /** True while sound is muted; `volume` keeps the level to return to. */
+  muted: boolean;
+  toggleMute: () => void;
+  /** Moves the playback position by `deltaMs` (negative goes back). */
+  seekBy: (deltaMs: number) => void;
   /** URL for a cached cover. `thumb` asks for the small static version. */
   artworkUrl: (name: string | null | undefined, thumb?: boolean) => string | undefined;
   startScan: () => Promise<void>;
@@ -68,6 +75,9 @@ interface LibraryContextValue {
   moveInQueue: (from: number, to: number) => void;
   clearQueue: () => void;
   playQueued: (offset: number) => void;
+  /** Arms the sleep timer (replacing any set before). */
+  setSleep: (request: SleepRequest) => void;
+  cancelSleep: () => void;
   saveQueueAsPlaylist: (name: string) => Promise<string | null>;
 
   setFavorite: (track: Track, on: boolean) => void;
@@ -88,8 +98,21 @@ interface LibraryContextValue {
 }
 
 const LibraryContext = createContext<LibraryContextValue | null>(null);
-/** Position is its own context so only the seek bar re-renders four times a second. */
-const PositionContext = createContext(0);
+/**
+ * The playback clock is its own context and is never replaced, so position
+ * changes reach only the components that subscribe to it (the seek bars).
+ */
+const ClockContext = createContext<PlaybackClock | null>(null);
+
+function readingFromState(state: PlaybackState): ClockReading {
+  return {
+    trackId: state.track?.id ?? null,
+    positionMs: state.positionMs,
+    playing: state.playing,
+    clockMs: state.clockMs,
+    durationMs: state.track?.durationMs ?? null,
+  };
+}
 
 /** `abc.jpg` or `abc.anim.gif` → `abc.thumb.jpg` (mirrors artwork.rs). */
 export function thumbName(name: string): string {
@@ -101,9 +124,10 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
   const [overview, setOverview] = useState<Overview>(EMPTY_OVERVIEW);
   const [favorites, setFavorites] = useState<ReadonlySet<number>>(new Set());
   const [playback, setPlayback] = useState<PlaybackState>(EMPTY_PLAYBACK);
-  const [positionMs, setPositionMs] = useState(0);
   const [versions, setVersions] = useState<Versions>(NO_VERSIONS);
   const [volume, setVolumeState] = useState(boot.settings.volume);
+  const [muted, setMuted] = useState(false);
+  const [clock] = useState(() => new PlaybackClock());
   const [scan, setScan] = useState<ScanStatus>({ running: false, done: 0, total: 0, summary: null });
   const playbackRef = useRef(playback);
   playbackRef.current = playback;
@@ -112,10 +136,15 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
 
   const fail = useCallback((error: unknown) => notify(errorMessage(error), "error"), [notify]);
 
-  const applyPlayback = useCallback((state: PlaybackState) => {
-    setPlayback(state);
-    setPositionMs(state.positionMs);
-  }, []);
+  const applyPlayback = useCallback(
+    (state: PlaybackState) => {
+      setPlayback(state);
+      clock.update(readingFromState(state));
+    },
+    [clock],
+  );
+
+  useEffect(() => clock.attach(), [clock]);
 
   const refreshPlayback = useCallback(() => {
     api.playbackState().then(applyPlayback).catch(fail);
@@ -150,8 +179,9 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const stops = [
       listen<Progress>(EVENTS.progress, ({ payload }) => {
-        setPositionMs(payload.positionMs);
         const current = playbackRef.current;
+        const known = current.track?.id === payload.trackId ? current.track : null;
+        clock.update({ ...payload, durationMs: known?.durationMs ?? null });
         if (payload.playing !== current.playing || payload.trackId !== (current.track?.id ?? null)) {
           refreshPlayback();
         }
@@ -169,9 +199,12 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
       ),
       // A scan started by the folder watcher rather than by this window.
       listen<ScanSummary>(EVENTS.scanFinished, ({ payload }) => reportScan(payload)),
+      // The core paused playback for the sleep timer; the state follows in
+      // playback:changed, so only the message is needed here.
+      listen(EVENTS.sleepEnded, () => notify(t("sleep.ended"))),
     ];
     return () => stops.forEach((stop) => void stop.then((off) => off()));
-  }, [bump, refreshOverview, refreshPlayback, reportScan]);
+  }, [bump, clock, notify, refreshOverview, refreshPlayback, reportScan]);
 
   const startScan = useCallback(async () => {
     if (scanningRef.current) return;
@@ -195,6 +228,7 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
     refreshOverview();
     refreshPlayback();
     setVolumeState(profileVolume);
+    setMuted(false);
     setVersions(NO_VERSIONS);
     if (ready && hasFolders) void startScan();
     // Folder edits trigger their own scan; this runs per profile and after setup.
@@ -223,6 +257,19 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
       versions,
       scan,
       volume,
+      muted,
+      toggleMute: () => {
+        // Mute is not saved: the stored volume stays the level to return to.
+        const next = !muted;
+        setMuted(next);
+        api.setVolumeLive(next ? 0 : volume).catch(fail);
+      },
+      seekBy: (deltaMs) => {
+        const track = playback.track;
+        if (!track) return;
+        const target = Math.min(Math.max(0, clock.position() + deltaMs), Math.max(0, track.durationMs - 1000));
+        act(api.seek(Math.floor(target)));
+      },
       artworkUrl: (name, thumb) =>
         name ? convertFileSrc(`${artworkDir}\\${thumb ? thumbName(name) : name}`) : undefined,
       startScan,
@@ -247,6 +294,7 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
       setVolume: (percent) => {
         const next = Math.min(100, Math.max(0, Math.round(percent)));
         setVolumeState(next);
+        setMuted(false); // changing the volume always makes it audible again
         // The engine changes at once; settings are written when the slider rests.
         api.setVolumeLive(next).catch(fail);
         window.clearTimeout(volumeTimer.current);
@@ -278,6 +326,8 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
       moveInQueue: (from, to) => act(api.queueMove(from, to)),
       clearQueue: () => act(api.queueClear()),
       playQueued: (offset) => act(api.queuePlay(offset)),
+      setSleep: (request) => act(api.sleepSet(request)),
+      cancelSleep: () => act(api.sleepCancel()),
       saveQueueAsPlaylist: (name) =>
         api.playlistFromQueue(name).catch((error) => {
           fail(error);
@@ -359,11 +409,11 @@ export function LibraryProvider({ children }: { children: ReactNode }) {
         api.preferSource(track.id).catch(fail);
       },
     };
-  }, [act, boot.artworkDir, fail, favorites, notify, overview, playback, refreshOverview, scan, startScan, versions, volume]);
+  }, [act, boot.artworkDir, fail, favorites, notify, overview, playback, refreshOverview, scan, startScan, versions, volume, muted, clock]);
 
   return (
     <LibraryContext.Provider value={value}>
-      <PositionContext.Provider value={positionMs}>{children}</PositionContext.Provider>
+      <ClockContext.Provider value={clock}>{children}</ClockContext.Provider>
     </LibraryContext.Provider>
   );
 }
@@ -374,8 +424,21 @@ export function useLibrary(): LibraryContextValue {
   return value;
 }
 
-export function usePosition(): number {
-  return useContext(PositionContext);
+export function usePlaybackClock(): PlaybackClock {
+  const clock = useContext(ClockContext);
+  if (!clock) throw new Error("usePlaybackClock must be used inside LibraryProvider");
+  return clock;
+}
+
+/**
+ * The playback position, re-rendering only when it moves into a new step of
+ * `granularityMs` (and at once after a seek, pause, or track change).
+ */
+export function usePosition(granularityMs = 1000): number {
+  const clock = usePlaybackClock();
+  const [position, setPosition] = useState(() => clock.position());
+  useEffect(() => clock.subscribe(setPosition, granularityMs), [clock, granularityMs]);
+  return position;
 }
 
 /**

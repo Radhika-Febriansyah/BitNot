@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -22,11 +22,12 @@ use crate::library::{
     TrashItem,
 };
 use crate::paths::AppPaths;
-use crate::playback::{Controller, Output, PlaybackState, Progress};
+use crate::playback::{Controller, Output, PlaybackState, Progress, Tick};
 use crate::profiles::{self, DeletedProfile, Profile};
 use crate::queue::Repeat;
 use crate::scanner::{self, ScanSummary};
 use crate::settings::{self, Settings};
+use crate::sleep::SleepRequest;
 use crate::watcher::FolderWatcher;
 
 /// Called when the watched music folders change on disk.
@@ -743,12 +744,25 @@ impl AppCore {
         self.with_playback(|p, conn, now| p.play_upcoming(conn, offset, now))
     }
 
-    /// Called a few times a second by the shell. Returns whether the track or
-    /// queue changed, and the current position.
-    pub fn tick(&self) -> Result<(bool, Progress)> {
+    /// Arms the sleep timer, measured on the monotonic clock.
+    pub fn sleep_set(&self, request: SleepRequest) -> Result<PlaybackState> {
+        self.with_playback(|p, _, _| p.set_sleep(request, Instant::now()))
+    }
+
+    pub fn sleep_cancel(&self) -> Result<PlaybackState> {
+        self.with_playback(|p, _, _| {
+            p.cancel_sleep();
+            Ok(())
+        })
+    }
+
+    /// Called a few times a second by the shell. Returns what the tick did
+    /// (track or queue changed, sleep timer fired) and the current position.
+    pub fn tick(&self) -> Result<(Tick, Progress)> {
         let mut playback = self.lock_playback()?;
         let inner = self.lock()?;
-        let changed = playback.tick(&inner.profile_db, now_unix())?;
+        let outcome = playback.tick_at(&inner.profile_db, now_unix(), Instant::now())?;
+        let changed = outcome.changed;
         let progress = playback.progress();
         let tick = self.ticks.fetch_add(1, Ordering::Relaxed);
         if changed {
@@ -757,7 +771,7 @@ impl AppCore {
             // So a crash loses at most a few seconds of position.
             let _ = playback.save_position(&inner.profile_db);
         }
-        Ok((changed, progress))
+        Ok((outcome, progress))
     }
 
     /// Records a clean shutdown so the next start does not report a crash.
