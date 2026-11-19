@@ -83,6 +83,12 @@ impl SleepTimer {
         self.armed = None;
     }
 
+    /// True while playback is to stop when the current track ends (so no
+    /// next track should be prepared to follow it).
+    pub fn stops_after_track(&self) -> bool {
+        self.armed == Some(Armed::EndOfTrack)
+    }
+
     #[cfg(test)]
     pub fn is_armed(&self) -> bool {
         self.armed.is_some()

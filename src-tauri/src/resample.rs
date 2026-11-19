@@ -36,6 +36,9 @@ const PHASES: usize = 512;
 /// 20 kHz, −1.8 dB at 21 kHz) and a 23 kHz tone is suppressed by 91 dB when
 /// converting 48 to 44.1 kHz. The PoC's 32 taps at 0.91 was −5.7 dB at 20 kHz.
 const CUTOFF: f64 = 0.97;
+/// Output frames over which a track at the output rate that follows a change
+/// of rate is moved onto whole frames (0.1 s at 48 kHz).
+const GLIDE_FRAMES: u32 = 4_800;
 /// Kaiser window shape (stop band near −90 dB).
 const BETA: f64 = 9.0;
 
@@ -72,6 +75,12 @@ fn kernel() -> &'static [f64] {
     })
 }
 
+/// Builds the kernel table now (a few milliseconds, once per process), so
+/// the audio thread never pays for it when resampling first starts.
+pub fn prepare_kernel() {
+    kernel();
+}
+
 #[inline]
 fn kernel_at(table: &[f64], t: f64) -> f64 {
     let x = t.abs() * PHASES as f64;
@@ -83,17 +92,16 @@ fn kernel_at(table: &[f64], t: f64) -> f64 {
     table[i] + f * (table[i + 1] - table[i])
 }
 
-/// A stretch of input at one sample rate.
+/// A stretch of input at one sample rate. Frame numbers count from the
+/// segment's first frame.
 struct Segment {
     rate: u32,
-    /// Input frames from `start` on.
+    /// Frames from `start` on.
     frames: VecDeque<[f32; 2]>,
+    /// Number of the first frame still kept.
     start: u64,
-    /// First input frame that belongs to the next segment, once known.
+    /// Number of frames in the segment, once its end is known.
     end: Option<u64>,
-    /// Input position of the next output frame: `index + fraction / out_rate`.
-    index: u64,
-    fraction: u64,
 }
 
 impl Segment {
@@ -103,8 +111,6 @@ impl Segment {
             frames: VecDeque::from([first]),
             start: 0,
             end: None,
-            index: 0,
-            fraction: 0,
         }
     }
 
@@ -128,6 +134,56 @@ impl Segment {
             self.frames.pop_front();
             self.start += 1;
         }
+    }
+
+    /// How much the kernel is stretched for a band limit of `band_rate`
+    /// (the lowest rate involved): 1 when this segment's rate is that rate.
+    fn scale(&self, band_rate: u32) -> f64 {
+        (band_rate as f64 / self.rate as f64).min(1.0)
+    }
+
+    /// How many frames either side of a position the filter reaches.
+    fn reach(&self, band_rate: u32) -> u64 {
+        (HALF as f64 / self.scale(band_rate)).ceil() as u64
+    }
+
+    /// The band-limited value of this segment at `position` (in its own
+    /// frames; it may lie outside the segment, where the segment is silent).
+    /// Near a change of rate, both segments use the same band limit, so
+    /// their contributions add up to the continuous signal.
+    fn value_at(&mut self, position: f64, band_rate: u32) -> [f64; 2] {
+        let table = kernel();
+        let scale = self.scale(band_rate);
+        let reach = self.reach(band_rate) as i64;
+        let base = position.floor() as i64;
+        let fraction = position - base as f64;
+        let first = base + 1 - reach;
+        let last = base + reach;
+        let limit = self.end.unwrap_or(u64::MAX).min(self.buffered_to()) as i64;
+        let mut acc = [0.0f64; 2];
+        if first >= self.start as i64 && last < limit {
+            // Every frame the filter reaches is buffered: walk a slice.
+            let offset = (first - self.start as i64) as usize;
+            let frames = &self.frames.make_contiguous()[offset..offset + 2 * reach as usize];
+            let mut t = (reach as f64 - 1.0 + fraction) * scale;
+            for x in frames {
+                let weight = kernel_at(table, t);
+                acc[0] += weight * x[0] as f64;
+                acc[1] += weight * x[1] as f64;
+                t -= scale;
+            }
+        } else {
+            // Near an edge: frames outside the segment are silence.
+            for n in first.max(0)..=last {
+                let weight = kernel_at(table, (position - n as f64) * scale);
+                if weight != 0.0 {
+                    let x = self.frame(n);
+                    acc[0] += weight * x[0] as f64;
+                    acc[1] += weight * x[1] as f64;
+                }
+            }
+        }
+        [acc[0] * scale, acc[1] * scale]
     }
 }
 
@@ -220,9 +276,20 @@ pub struct OutputStage<S: Source> {
     /// Format of the samples being read: from the last marked track start,
     /// or (before any) what the input reports.
     format: (usize, u32),
-    segment: Option<Segment>,
-    /// The first frame of the next segment, read while finishing this one.
+    /// The segment being played.
+    current: Option<Segment>,
+    /// The segment before it, kept while the filter still reaches into it.
+    previous: Option<Segment>,
+    /// The segment after it, read ahead once the current one's end is known.
+    following: Option<Segment>,
+    /// The first frame of the segment after `following` (a very short track).
     pending: Option<(u32, [f32; 2])>,
+    /// Position of the next output frame in `current`: `index + fraction / out_rate`.
+    index: u64,
+    fraction: u64,
+    /// While moving onto whole frames after a change of rate: frames left,
+    /// and the offset still to absorb (in units of 1 / out_rate of a frame).
+    glide: Option<(u32, i64)>,
     /// The input has run out (rodio's Player queue never does; test sources do).
     ended: bool,
     frame: [f32; 2],
@@ -238,8 +305,13 @@ impl<S: Source> OutputStage<S> {
             out_rate: out_rate.get(),
             starts,
             format,
-            segment: None,
+            current: None,
+            previous: None,
+            following: None,
             pending: None,
+            index: 0,
+            fraction: 0,
+            glide: None,
             ended: false,
             frame: [0.0; 2],
             channel: 2,
@@ -274,104 +346,232 @@ impl<S: Source> OutputStage<S> {
         Some((rate, frame))
     }
 
-    /// Makes sure input frame `n` of the current segment is buffered (or the
-    /// segment's end is known). Stops at a change of sample rate.
-    fn fill(&mut self, n: u64) {
+    /// Reads until frame `n` of the current segment is buffered, or its end
+    /// is known. A change of rate ends it and starts the following segment.
+    fn fill_current(&mut self, n: u64) {
         loop {
-            let segment = self.segment.as_ref().expect("segment exists");
-            if segment.end.is_some() || segment.buffered_to() > n {
+            let current = self.current.as_ref().expect("current segment");
+            if current.end.is_some() || current.buffered_to() > n {
                 return;
             }
-            let segment_rate = segment.rate;
-            match self.read() {
-                Some((rate, frame)) if rate == segment_rate => {
-                    self.segment.as_mut().unwrap().frames.push_back(frame);
+            let rate = current.rate;
+            let read = self.read();
+            let current = self.current.as_mut().unwrap();
+            match read {
+                Some((r, frame)) if r == rate => current.frames.push_back(frame),
+                Some((r, frame)) => {
+                    current.end = Some(current.buffered_to());
+                    self.following = Some(Segment::new(r, frame));
                 }
-                Some((rate, frame)) => {
-                    let segment = self.segment.as_mut().unwrap();
-                    segment.end = Some(segment.buffered_to());
-                    self.pending = Some((rate, frame));
-                }
-                None => {
-                    let segment = self.segment.as_mut().unwrap();
-                    segment.end = Some(segment.buffered_to());
-                }
+                None => current.end = Some(current.buffered_to()),
             }
         }
     }
 
-    fn next_frame(&mut self) -> Option<[f32; 2]> {
+    /// Reads until frame `n` of the following segment is buffered, or its end is known.
+    fn fill_following(&mut self, n: u64) {
         loop {
-            if self.segment.is_none() {
-                let (rate, first) = self.pending.take().or_else(|| self.read())?;
-                self.segment = Some(Segment::new(rate, first));
+            let Some(following) = self.following.as_ref() else {
+                return;
+            };
+            if following.end.is_some() || following.buffered_to() > n {
+                return;
             }
-            let out_rate = self.out_rate;
-            let index = self.segment.as_ref().unwrap().index;
-            let rate = self.segment.as_ref().unwrap().rate;
-
-            if rate == out_rate {
-                // Same rate: pass through exactly.
-                self.fill(index);
-                let segment = self.segment.as_mut().unwrap();
-                if segment.end.is_some_and(|end| index >= end) {
-                    self.segment = None;
-                    continue;
+            let rate = following.rate;
+            let read = self.read();
+            let following = self.following.as_mut().unwrap();
+            match read {
+                Some((r, frame)) if r == rate => following.frames.push_back(frame),
+                Some((r, frame)) => {
+                    following.end = Some(following.buffered_to());
+                    self.pending = Some((r, frame));
                 }
-                let frame = segment.frame(index as i64);
-                segment.index += 1;
-                segment.trim(segment.index);
-                return Some(frame);
+                None => following.end = Some(following.buffered_to()),
             }
+        }
+    }
 
-            // Different rate: windowed-sinc interpolation at the output time.
-            let scale = (out_rate as f64 / rate as f64).min(1.0);
-            let reach = (HALF as f64 / scale).ceil() as u64;
-            self.fill(index + reach);
-            let segment = self.segment.as_mut().unwrap();
-            if segment.end.is_some_and(|end| index >= end) {
-                self.segment = None;
+    /// Maps a position in a segment that ends at `end` (frames, at `from`
+    /// Hz) to a position in the segment that follows it (at `to` Hz). Each
+    /// frame stands for the half-frame either side of it, so the two grids
+    /// are joined where those halves meet; otherwise the two sides would
+    /// overlap by half the difference of their frame lengths.
+    fn across(position: f64, end: f64, from: u32, to: u32) -> f64 {
+        (position - end + 0.5) * to as f64 / from as f64 - 0.5
+    }
+
+    /// The band limit near the current segment: the lowest of the output
+    /// rate, its rate, and the rates of the neighbours it may overlap.
+    fn band_rate(&self) -> u32 {
+        let mut band = self.out_rate;
+        for segment in [&self.current, &self.previous, &self.following]
+            .into_iter()
+            .flatten()
+        {
+            band = band.min(segment.rate);
+        }
+        band
+    }
+
+    /// The moment the current segment ends, as a position in it, and the
+    /// first output position at or after that moment.
+    fn first_position_after_end(&self) -> Option<f64> {
+        let current = self.current.as_ref()?;
+        let end = current.end?;
+        let out = self.out_rate as u64;
+        // Positions advance by rate/out per output frame, exactly.
+        let now = self.index * out + self.fraction;
+        let target = end * out;
+        let steps = if now >= target {
+            0
+        } else {
+            (target - now).div_ceil(current.rate as u64)
+        };
+        Some((now + steps * current.rate as u64) as f64 / out as f64)
+    }
+
+    /// Moves on to the following segment once the current one has ended.
+    /// Returns false at the end of the stream.
+    fn switch(&mut self) -> bool {
+        let first = self.first_position_after_end().unwrap();
+        let Some(next) = self.following.take() else {
+            // Input ended; nothing follows.
+            self.current = None;
+            return false;
+        };
+        let current = self.current.take().unwrap();
+        let end = current.end.unwrap() as f64;
+        let position = Self::across(first, end, current.rate, next.rate);
+        let out = self.out_rate as u64;
+        let index = position.floor().max(0.0);
+        let mut fraction = ((position - index) * out as f64).round() as u64;
+        self.index = index as u64;
+        if fraction >= out {
+            fraction -= out;
+            self.index += 1;
+        }
+        self.fraction = fraction;
+        // A segment at the output rate is passed through on whole frames.
+        // Rather than jump there (a time step of up to half a frame), the
+        // position glides onto the nearest whole frame over GLIDE_FRAMES.
+        self.glide = None;
+        if next.rate == self.out_rate && fraction != 0 {
+            let units = if fraction <= out / 2 {
+                -(fraction as i64)
+            } else {
+                (out - fraction) as i64
+            };
+            self.glide = Some((GLIDE_FRAMES, units));
+        }
+        self.previous = Some(current);
+        self.current = Some(next);
+        if let Some((rate, frame)) = self.pending.take() {
+            self.following = Some(Segment::new(rate, frame));
+        }
+        true
+    }
+
+    fn next_frame(&mut self) -> Option<[f32; 2]> {
+        let out = self.out_rate;
+        if self.current.is_none() {
+            let (rate, first) = self.pending.take().or_else(|| self.read())?;
+            self.current = Some(Segment::new(rate, first));
+            self.index = 0;
+            self.fraction = 0;
+        }
+        loop {
+            let reach = self.current.as_ref().unwrap().reach(self.band_rate());
+            self.fill_current(self.index + reach);
+            let current = self.current.as_ref().unwrap();
+            if current.end.is_some_and(|end| self.index >= end) {
+                if !self.switch() {
+                    return None;
+                }
                 continue;
             }
-            let table = kernel();
-            let fraction = segment.fraction as f64 / out_rate as f64;
-            let first = index as i64 + 1 - reach as i64;
-            let last = index as i64 + reach as i64;
-            let limit = segment.end.unwrap_or(u64::MAX).min(segment.buffered_to()) as i64;
-            let mut acc = [0.0f64; 2];
-            if first >= segment.start as i64 && last < limit {
-                // Every frame the filter reaches is buffered: walk a slice.
-                let base = (first - segment.start as i64) as usize;
-                let frames = &segment.frames.make_contiguous()[base..base + 2 * reach as usize];
-                let mut t = (reach as f64 - 1.0 + fraction) * scale;
-                for x in frames {
-                    let weight = kernel_at(table, t);
-                    acc[0] += weight * x[0] as f64;
-                    acc[1] += weight * x[1] as f64;
-                    t -= scale;
-                }
-            } else {
-                // Near the start of a segment or its end: missing frames are silence.
-                for n in first..=last {
-                    let distance = (index as i64 - n) as f64 + fraction;
-                    let weight = kernel_at(table, distance * scale);
-                    if weight != 0.0 {
-                        let x = segment.frame(n);
-                        acc[0] += weight * x[0] as f64;
-                        acc[1] += weight * x[1] as f64;
-                    }
-                }
-            }
-            // Exact rational step: no drift however long the stream runs.
-            segment.fraction += rate as u64;
-            while segment.fraction >= out_rate as u64 {
-                segment.fraction -= out_rate as u64;
-                segment.index += 1;
-            }
-            let keep_from = (segment.index + 1).saturating_sub(reach);
-            segment.trim(keep_from);
-            return Some([(acc[0] * scale) as f32, (acc[1] * scale) as f32]);
+            break;
         }
+
+        let band = self.band_rate();
+        let current = self.current.as_ref().unwrap();
+        let (rate, reach) = (current.rate, current.reach(band));
+        let position = self.index as f64 + self.fraction as f64 / out as f64;
+
+        // The following segment is needed when the filter reaches past the end.
+        let following_at = match current.end {
+            Some(end) if self.index + reach >= end && self.following.is_some() => {
+                let next = self.following.as_ref().unwrap();
+                let at = Self::across(position, end as f64, rate, next.rate);
+                let needed = (at.max(0.0).ceil() as u64) + next.reach(band);
+                self.fill_following(needed);
+                Some(at)
+            }
+            _ => None,
+        };
+        // The previous segment matters while the filter still reaches back into it.
+        let previous_at = match self.previous.as_ref() {
+            Some(previous) => {
+                // The inverse of `across`, from this segment back into the previous one.
+                let at = (position + 0.5) * previous.rate as f64 / rate as f64 - 0.5
+                    + previous.end.unwrap() as f64;
+                if at - previous.end.unwrap() as f64 >= previous.reach(band) as f64 {
+                    self.previous = None;
+                    None
+                } else {
+                    Some(at)
+                }
+            }
+            None => None,
+        };
+
+        let current = self.current.as_mut().unwrap();
+        let value =
+            if rate == out && self.fraction == 0 && following_at.is_none() && previous_at.is_none()
+            {
+                // At the output rate and clear of any boundary: pass through exactly.
+                let x = current.frame(self.index as i64);
+                [x[0] as f64, x[1] as f64]
+            } else {
+                // Away from boundaries the band limit is this segment's own.
+                let band = if following_at.is_some() || previous_at.is_some() {
+                    band
+                } else {
+                    out.min(rate)
+                };
+                let mut v = current.value_at(position, band);
+                if let (Some(at), Some(next)) = (following_at, self.following.as_mut()) {
+                    let w = next.value_at(at, band);
+                    v = [v[0] + w[0], v[1] + w[1]];
+                }
+                if let (Some(at), Some(previous)) = (previous_at, self.previous.as_mut()) {
+                    let w = previous.value_at(at, band);
+                    v = [v[0] + w[0], v[1] + w[1]];
+                }
+                v
+            };
+
+        // Exact rational step: no drift however long the stream runs. While
+        // gliding onto whole frames, each step is nudged by a share of the
+        // remaining offset (about 100 ppm for a tenth of a second).
+        let mut step = rate as i64;
+        if let Some((left, units)) = self.glide.as_mut() {
+            let nudge = *units / *left as i64;
+            step += nudge;
+            *units -= nudge;
+            *left -= 1;
+            if *left == 0 {
+                self.glide = None;
+            }
+        }
+        self.fraction = (self.fraction as i64 + step) as u64;
+        while self.fraction >= out as u64 {
+            self.fraction -= out as u64;
+            self.index += 1;
+        }
+        let current = self.current.as_mut().unwrap();
+        current.trim((self.index + 1).saturating_sub(reach));
+        // f32 → f64 → f32 is exact, so passed-through frames stay bit-exact.
+        Some([value[0] as f32, value[1] as f32])
     }
 }
 
@@ -463,6 +663,33 @@ pub(crate) mod test_audio {
         std::fs::write(path, out).unwrap();
     }
 
+    /// 16-bit stereo AIFF.
+    pub fn write_aiff(path: &Path, rate: u32, samples: &[f32]) {
+        let mut ssnd = vec![0u8; 8];
+        for s in samples {
+            ssnd.extend_from_slice(&((s.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_be_bytes());
+        }
+        let exponent = 16383 + (31 - rate.leading_zeros()) as u16;
+        let mantissa = (rate as u64) << (63 - (exponent - 16383));
+        let mut comm = Vec::new();
+        comm.extend_from_slice(&2i16.to_be_bytes());
+        comm.extend_from_slice(&((samples.len() / 2) as u32).to_be_bytes());
+        comm.extend_from_slice(&16i16.to_be_bytes());
+        comm.extend_from_slice(&exponent.to_be_bytes());
+        comm.extend_from_slice(&mantissa.to_be_bytes());
+        let mut body = b"AIFF".to_vec();
+        body.extend_from_slice(b"COMM");
+        body.extend_from_slice(&(comm.len() as u32).to_be_bytes());
+        body.extend_from_slice(&comm);
+        body.extend_from_slice(b"SSND");
+        body.extend_from_slice(&(ssnd.len() as u32).to_be_bytes());
+        body.extend_from_slice(&ssnd);
+        let mut out = b"FORM".to_vec();
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(&body);
+        std::fs::write(path, out).unwrap();
+    }
+
     /// Decodes a file the way the application does.
     pub fn decoder(path: &Path) -> rodio::Decoder<std::io::BufReader<std::fs::File>> {
         let file = std::fs::File::open(path).unwrap();
@@ -471,7 +698,7 @@ pub(crate) mod test_audio {
             .with_data(std::io::BufReader::new(file))
             .with_byte_len(len)
             .with_seekable(true)
-            .with_hint("wav")
+            .with_hint(path.extension().and_then(|e| e.to_str()).unwrap_or("wav"))
             .build()
             .unwrap()
     }
@@ -711,56 +938,103 @@ mod tests {
         assert!(around < 2e-4, "deviation at the join {around:e}");
     }
 
-    #[test]
-    fn a_change_of_rate_between_tracks_switches_cleanly() {
+    /// One continuous tone split across two files at different rates, joined
+    /// in the queue: what comes out, and where the join is.
+    fn continuous_pair(ra: u32, rb: u32, out_rate: u32) -> (Vec<f32>, usize, usize) {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.wav");
         let b = dir.path().join("b.wav");
-        write_wav(&a, 44_100, 2, &tone(997.0, 0.5, 44_100, 0.0, 44_100));
+        // The join falls mid-cycle and off any packet boundary.
+        let frames_a = ra as usize + 37;
+        let frames_b = rb as usize / 2 + 11;
+        write_wav(&a, ra, 2, &tone(997.0, 0.5, ra, 0.0, frames_a));
+        write_wav(
+            &b,
+            rb,
+            2,
+            &tone(997.0, 0.5, rb, frames_a as f64 / ra as f64, frames_b),
+        );
+        let mut c = chain(out_rate);
+        c.append(decoder(&a));
+        c.append(decoder(&b));
+        let ideal_frames = ((frames_a as f64 / ra as f64 + frames_b as f64 / rb as f64)
+            * out_rate as f64)
+            .round() as usize;
+        let mut out = c.pull((ideal_frames + 4_000) * 2);
+        // The tone (sin, cos) has constant power 0.25; where it falls below
+        // half is where B ends (the filter's ringing after an abrupt end is
+        // not counted as length).
+        let end = out
+            .chunks(2)
+            .rposition(|f| f[0] * f[0] + f[1] * f[1] > 0.125)
+            .unwrap()
+            + 1;
+        out.truncate(end * 2);
+        let join = (frames_a as f64 * out_rate as f64 / ra as f64).round() as usize;
+        (out, join, ideal_frames)
+    }
+
+    #[test]
+    fn a_change_of_rate_keeps_a_continuous_signal_continuous() {
+        for (ra, rb, out_rate) in [
+            (44_100, 48_000, 48_000),
+            (48_000, 44_100, 48_000),
+            (44_100, 48_000, 44_100),
+            (48_000, 44_100, 44_100),
+        ] {
+            let (out, join, ideal_frames) = continuous_pair(ra, rb, out_rate);
+            let reference = ideal(997.0, 0.5, out_rate, ideal_frames);
+            // Around the join the output follows the tone: no gap, no dip.
+            let range = (join - 480) * 2..(join + 480) * 2;
+            let worst = max_difference(&out[range.clone()], &reference[range.clone()]);
+            let silent = out[range]
+                .chunks(2)
+                .filter(|f| f[0] == 0.0 && f[1] == 0.0)
+                .count();
+            // Exact length: within one frame of the two files' total duration.
+            let length = out.len() as i64 / 2 - ideal_frames as i64;
+            println!("{ra} → {rb} Hz at {out_rate} Hz: largest deviation within 10 ms of the join {worst:.5}, length error {length} frames");
+            assert_eq!(silent, 0, "{ra} → {rb}: silence at the join");
+            // 0.5 amplitude: 0.01 is −34 dB relative to the tone, for under a millisecond.
+            assert!(worst < 0.01, "{ra} → {rb} at {out_rate}: deviation {worst}");
+            assert!(
+                length.abs() <= 1,
+                "{ra} → {rb} at {out_rate}: {length} frames"
+            );
+            // Timing holds afterwards: still on the ideal tone half a second on
+            // (within the half-frame glide for a track at the output rate).
+            let late = (ideal_frames - 2_000) * 2..(ideal_frames - 1_000) * 2;
+            let after = max_difference(&out[late.clone()], &reference[late]);
+            assert!(
+                after < 0.035,
+                "{ra} → {rb} at {out_rate}: drifted by {after}"
+            );
+        }
+    }
+
+    #[test]
+    fn after_a_change_of_rate_a_track_at_the_output_rate_is_bit_exact_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.wav");
+        let b = dir.path().join("b.wav");
+        write_wav(&a, 44_100, 2, &tone(997.0, 0.5, 44_100, 0.0, 44_100 + 37));
         write_wav(&b, 48_000, 2, &tone(440.0, 0.5, 48_000, 0.0, 48_000));
         let b_samples: Vec<f32> = decoder(&b).collect();
         let mut c = chain(48_000);
         c.append(decoder(&a));
         c.append(decoder(&b));
         let out = c.pull(96_000 * 2);
-        // Track A (1 s) becomes exactly 48 000 frames; track B follows from
-        // the very next frame, passed through unchanged.
-        assert!(out[96_000..]
-            .iter()
-            .zip(&b_samples)
-            .all(|(x, y)| x.to_bits() == y.to_bits()));
-        let silent = out
-            .chunks(2)
-            .skip(47_000)
-            .take(2_000)
-            .filter(|f| f[0] == 0.0 && f[1] == 0.0)
-            .count();
-        assert_eq!(silent, 0, "no silence inserted at the switch");
-    }
-
-    #[test]
-    fn mono_is_played_on_both_sides_and_extra_channels_are_dropped() {
-        let mono: Vec<f32> = (0..4_800).map(|i| (i as f32 * 0.001).sin()).collect();
-        let out = through(
-            SamplesBuffer::new(NonZero::new(1).unwrap(), nz(48_000), mono.clone()),
-            48_000,
-        );
-        assert_eq!(out.len(), mono.len() * 2);
-        assert!(out
-            .chunks(2)
-            .zip(&mono)
-            .all(|(f, m)| f[0] == *m && f[1] == *m));
-
-        let quad: Vec<f32> = (0..4_800 * 4)
-            .map(|i| (i % 4) as f32 * 0.1 + 0.05)
-            .collect();
-        let out = through(
-            SamplesBuffer::new(NonZero::new(4).unwrap(), nz(48_000), quad),
-            48_000,
-        );
-        assert!(out
-            .chunks(2)
-            .all(|f| f[0] == 0.05 && (f[1] - 0.15).abs() < 1e-7));
+        // After the 0.1 s glide onto whole frames, B is passed through exactly,
+        // within a frame of where its start fell.
+        let join = ((44_100.0 + 37.0) * 48_000.0 / 44_100.0) as usize;
+        let window = &out[(join + 6_000) * 2..(join + 6_100) * 2];
+        let found = (5_998..6_003).find(|&k| {
+            window
+                .iter()
+                .zip(&b_samples[k * 2..])
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+        });
+        assert!(found.is_some(), "B is not bit-exact after the glide");
     }
 
     #[test]

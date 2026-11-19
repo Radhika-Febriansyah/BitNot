@@ -6,6 +6,7 @@ mod core;
 mod db;
 mod diagnostics;
 mod error;
+mod gapless;
 mod library;
 mod paths;
 mod playback;

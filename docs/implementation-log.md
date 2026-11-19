@@ -340,3 +340,31 @@ Details, measurements, and corrections to the proof-of-concept record: `docs/rep
   - Volume changes, seek, pause and resume, and 44.1 ↔ 48 kHz track changes worked in the app.
   - No listening test was performed.
 - **Not done:** gapless, EQ, crossfade, visualizer (unchanged scope); hardware tests at other device rates or channel counts; lossy formats measured through the stage.
+
+### Gapless playback (2026-11-19)
+
+Details, measurements, and limitations: `docs/reports/phase-3-assessment.md`, section 11.
+
+- **New `src-tauri/src/gapless.rs`:**
+  - A `TrackChain` is the one source the Player gets per load. When the current decoder runs dry, it continues with the prepared next track on the audio thread, with no polling, decoder opening, or source replacement at the boundary.
+  - Finished tracks are dropped there, so at most two tracks are held.
+  - Preparations are tagged with the transition count, so a stale one is never played.
+  - Position is counted per track.
+- **Controller (`playback.rs`):**
+  - `sync_preload` prepares the track automatic advance would play (a copy of the queue advanced with `advance(true)`: repeat, shuffle, and the end of the queue as before), after every command and tick. It skips the preparation when "stop after this track" is set, and does not retry a track that failed.
+  - `catch_up` advances the queue, makes the prepared track current, and counts its play when the chain reports a transition, never at preparation.
+  - `core.rs` runs `catch_up` before each command and `sync_preload` after.
+  - The `Output` trait gained `prepare_next` and `transitions`.
+- **Output stage (`resample.rs`) at a change of rate:**
+  - Overlapping contributions of neighbouring segments with a common band limit, grids joined at their half-sample edges, and the exact sub-sample position carried across.
+  - A track at the output rate glides onto whole frames over 0.1 s and is then bit-exact again.
+  - Deviation of a continuous tone at the join fell from 0.33 to about 0.005 (of 0.5); length exact to the frame.
+  - The kernel table is now built when the output is created (it cost about 2 ms on the audio thread at first use).
+- **Tests:** 20 new (5 chain, 2 rate-change, 9 controller with the fake output, 4 on the real `DeviceOutput`) plus 1 ignored cost measurement. 163 Rust tests pass over 3 runs; frontend unchanged (109).
+- **Device** (WASAPI loopback, other audio playing):
+  - Six phase-continuous pieces at 44.1/48 kHz played through five joins as one tone: 996.9999 Hz, 0.01 dB coherence loss, largest phase step between seconds 7.7 µs.
+  - Each piece became current in order and was counted once.
+  - Seek-near-end, Next, Previous, reorder, and pause worked.
+  - No listening test was performed.
+- **Cost:** preparing a track 0.13–0.28 ms; about 86–89 KB per prepared track; the slowest audio-thread sample at a switch 316 µs (of a 10 ms callback).
+- **Not measured:** MP3/AAC encoder-delay trimming (no encoder); the old engine's gap on the device; other devices and Windows 10.

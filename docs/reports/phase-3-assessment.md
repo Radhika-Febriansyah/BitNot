@@ -38,6 +38,7 @@ Date: 2026-11-18. Starting point: commit `eac3a35` on `main`, published to GitHu
 | Now Playing (§19) | Done 2026-11-18 (Milestone 1, step 2), Centered and Split layouts. Narrator check pending. |
 | Audio pipeline proof of concept (§6) | Done 2026-11-19. Recommendation: keep rodio and extend it (section 9). Two defects found in the current engine (9.4). |
 | Engine defect fixes (9.4) | Done 2026-11-19: constant-format output stage with windowed-sinc resampling (section 10). |
+| Gapless playback (§20) | Done 2026-11-19: track chain with a prepared next track; continuous across changes of rate (section 11). |
 | Dated playback clock (8.4) | Done 2026-11-18. Readings carry the core's monotonic time; both seek bars advance smoothly between them. |
 | Sleep timer (§20) | Done 2026-11-18 (Milestone 1, step 3), including "Stop after current track" (approved 2026-11-18). Narrator check pending. |
 | Equalizer, effects, crossfade, gapless, visualizer (§19–20) | Not started |
@@ -63,7 +64,7 @@ Revised 2026-11-18 after the BitChord study (section 8). Steps 1 and 2 are done.
 3. **Sleep timer** (done). Built on a monotonic end time in the core rather than a ticking countdown (8.4).
 4. **Dated playback clock** (done 2026-11-18; see the implementation log): each progress event carries the moment it was measured, and the interface advances the position smoothly between events. It jumps back only on a real seek or track change. Small; needed before synchronised lyrics and the visualizer, and it makes the seek bar smoother (8.4).
 5. **Audio pipeline proof of concept** (done 2026-11-19; results and recommendation in section 9). Waiting for approval before any production change.
-6. **Engine groundwork** (from the proof of concept, 9.9): fix the two defects it found in the current engine (done 2026-11-19, section 10), then **gapless,** then **equalizer and presets,** then **crossfade,** then **visualizer,** all on rodio.
+6. **Engine groundwork** (from the proof of concept, 9.9): fix the two defects it found in the current engine (done 2026-11-19, section 10), then **gapless** (done 2026-11-19, section 11), then **equalizer and presets,** then **crossfade,** then **visualizer,** all on rodio.
 7. **Playback event broadcast,** then **Mini Player.**
 8. **Lyrics:** licence review first; then the provider interface and fullscreen lyrics.
 9. **Audio effects** beyond EQ, where safe.
@@ -520,3 +521,123 @@ All deterministic, using generated signals.
 - **Seeking:** after a seek, the first millisecond of output blends the last pre-seek frames still in the filter. It is measured as clean 50 ms later, and it matches what rodio did before, minus the restart artefacts.
 - **First track:** the start-up glitch fix is verified by tests on an offline mixer and by the device's measured pitch and coherence. The first 10 ms on the device itself could not be isolated under the other application's audio.
 - **Output latency:** still not exposed by rodio (9.6).
+
+## 11. Gapless playback (2026-11-19)
+
+### 11.1 Before
+
+- The controller loaded one track at a time. It noticed the end of a track only on its 250 ms ticker, then opened the next file and replaced the Player's source (`stop`, then `append`).
+- The gap was therefore up to one tick plus file opening and queue flushing, inferred from the code (9.4 A). The old engine's gap was not measured on the device in this task.
+
+### 11.2 Architecture
+
+```
+controller (core thread)                   audio thread
+  sync_preload: open + probe next file  →  TrackChain [current track | prepared slot]
+  catch_up: account for transitions     ←  transitions counter, per-track position
+                                            → Player queue → OutputStage → mixer → WASAPI
+```
+
+- **One source per run of tracks** (`src-tauri/src/gapless.rs`).
+  - Each load gives the Player a single `TrackChain`. When the current track's decoder runs dry, the chain continues with the prepared next track in the same call on the audio thread.
+  - No polling, no decoder opening, and no source replacement happen at the boundary.
+  - The finished track is dropped there (its file closes), so at most two tracks are held: the one playing and the prepared one.
+- **Preparing** (`Controller::sync_preload`).
+  - The next track is the one automatic advance would play: computed on a copy of the queue with `advance(true)`, so repeat one, repeat all, shuffle order, and the end of the queue follow the existing semantics exactly.
+  - Its file is opened and probed on the controller's thread (the decoder reads lazily) and placed in the chain's slot. Alternative files of the same recording are tried as before.
+  - It runs after every playback command and every tick, and does nothing when the plan is unchanged. So reordering, removing, adding, Play Next, repeat or shuffle changes, and manual selection all replace or withdraw the preparation at once.
+  - Nothing is prepared when the sleep timer is set to stop after the current track.
+- **Stale preparations are never played.** Each preparation is tagged with the number of transitions the controller had seen. The chain takes it only for the transition after that many, so a preparation made before the controller noticed a transition cannot play in the wrong place; the chain ends instead.
+- **The track that cannot be prepared** (missing, unreadable, or undecodable) is recorded and not retried on every tick. The chain then ends at the boundary, and the existing path takes over: it skips the track with its message and plays the next one, with a gap, as before.
+- **Current track and play count** (`Controller::catch_up`).
+  - The chain counts its transitions. Before every command and every tick, the controller accounts for new ones: the queue advances, the prepared track becomes the loaded track, and its play is recorded at that moment.
+  - Preparing never counts a play or changes the visible track. The visible change lags the audio boundary by at most one tick (250 ms), the same as before.
+- **Position** is counted per track inside the chain (rodio's own position would run on across a whole chain) and resets at each boundary. Seek, pause, resume, stop, volume, the smooth playback clock, and state persistence are unchanged.
+
+### 11.3 Continuous resampling across a change of rate
+
+Joins at the same rate were already invisible to the output stage (section 10). For a change of rate, the stage was extended:
+
+- **Before:** each side of the change was filtered as if the other were silent, so both edges tapered. A phase-continuous 997 Hz tone across a 44.1 → 48 kHz join deviated by 0.33 (of 0.5 amplitude) at the join, and the leftover sub-sample position was dropped.
+- **Now, near a change of rate,** output frames sum the contributions of the previous, current, and following segment:
+  - Each segment is reconstructed at its own rate, with the same band limit (the lowest rate involved) so the edges add up.
+  - The two sample grids are joined where their half-sample edges meet, a sub-microsecond adjustment.
+  - The following segment is read ahead just far enough.
+- **Timing:** the exact sub-sample position carries across the switch.
+- **A track at the output rate** that follows a change of rate glides onto whole frames over 0.1 s (a step adjustment of about 100 ppm), and is then passed through bit-exact again. That replaces both a time jump and a permanent loss of exactness.
+- **First use:** the kernel table is built when the output is created, so the audio thread never builds it (it took about 2 ms on first use).
+
+### 11.4 Automated tests (deterministic, generated signals)
+
+**`gapless.rs` (5 tests)**
+
+| Test | Result |
+|---|---|
+| Join | The prepared track follows on the very next sample: output identical to the two tracks concatenated |
+| Position | Per track, and follows seeks |
+| Stale preparation | Never played |
+| Replacing or withdrawing before the boundary | Works |
+| 200 consecutive transitions | Every sample delivered once (exact total), 199 transitions, at most 2 tracks alive at any time, none left after the chain is dropped |
+
+**`resample.rs` (rate-change tests)**
+
+| Test | Result |
+|---|---|
+| Continuous tone across 44.1 → 48, 48 → 44.1 (48 kHz output) and the same pair at 44.1 kHz output | Largest deviation within 10 ms of the join 0.0052, 0.0053, 0.0060, 0.0055 (of 0.5; about −40 dB); no silent frame; length exact to the frame in all four |
+| Timing half a second later | On the ideal tone within the designed half-frame |
+| A 48 kHz track after a 44.1 kHz one | Bit-exact again after the glide |
+
+**`playback.rs`: controller with the fake output (9 tests)**
+
+- The next track is prepared, becomes current only at the boundary, and is counted then, not before.
+- Repeat One, Repeat All at the last track, and the end of the queue.
+- Shuffle order.
+- Reorder, remove, Play Next, and clear change the preparation; an unchanged plan is not prepared again.
+- Manual next, previous, and jump.
+- A failed preparation is not retried every tick, and at the boundary it is skipped with its message, as before.
+- Pause keeps the preparation; stop clears it.
+- Stop after this track withdraws it.
+- Seeking to the end moves on cleanly.
+
+**`playback.rs`: the real `DeviceOutput` on an offline mixer (4 tests)**
+
+| Test | Result |
+|---|---|
+| Joins | WAV 44.1 → 44.1 and 48 → 48 within 0.00004 and 0.00003 (the 16-bit files' precision); 44.1 → 48 and 48 → 44.1 within 0.0052 and 0.0053; WAV → AIFF at 44.1 kHz within 0.00004. No silent frame. Position per track |
+| Mono → stereo | Switches on the exact sample |
+| Six tracks through the real controller and ticker | One continuous tone at alternating rates: each track became current once, in order, with play count 1. No silent frame. The sharpest break was 2.92× the tone's own curvature (the known rate-change residue; a single lost frame would read about 15×). Timing at the end within 1 frame |
+| Next and previous | Still work during gapless playback |
+
+Earlier tests (section 10 and before) still pass.
+
+**Totals:** 163 Rust tests pass (3 consecutive runs), 2 ignored measurement tests. Frontend unchanged: 109 pass.
+
+### 11.5 On the real device (Windows 11, Realtek, 48 kHz)
+
+- **Method:** six 3-second WAV pieces of one phase-continuous 997 Hz tone at 44.1, 44.1, 48, 44.1, 48, and 48 kHz were played by the app (volume 40) through the joins 44.1 → 44.1, 44.1 → 48, 48 → 44.1, 44.1 → 48, and 48 → 48. Windows' output was recorded with WASAPI loopback (scratch tool, not in the repository). Another application was playing audio throughout.
+- **The app:** each piece became current in order, about every 3 s (3 287, 6 176, 9 247, 12 340, 15 202 ms after start), play count 1 each, and playback stopped after the last.
+- **Recording:** over 17.5 s spanning all five joins, the tone measured 996.9999 Hz with 0.01 dB of coherence loss. The largest phase step between consecutive seconds was 7.7 µs (17 blocks), within the designed sub-frame placement.
+  - A gap or time jump would show as a large phase step and a loss of coherence.
+  - A gap lasting an exact whole number of tone periods (1.003 ms each) would not show in phase. The automated sample-level tests cover that case.
+- **Per-join level check:** not usable. The other application's audio was much louder in the 997 Hz band than the test tone, so the level per 10 ms around each join could not be measured.
+- **Also checked in the app:** seeking to 2.9 s moved on to the next piece by itself; Next; Previous; reordering so piece 4 came next, then seeking near the end, moved on to piece 4; pause and resume. Nothing was logged.
+- **Listening:** not performed. All results are signal measurements.
+
+### 11.6 Performance (release build, this machine)
+
+| Measurement | Result |
+|---|---|
+| Preparing a track (open and probe a 3-minute file) | 0.13–0.28 ms (WAV), 0.13–0.20 ms (AIFF), on the controller's thread |
+| Memory held by a prepared track | About 86–89 KB (100 held at once: 8.4–8.7 MB, process private bytes) |
+| The switch on the audio thread | The slowest single sample around the boundary took 316 µs (decoding the new track's first packet, releasing the old), against 83 µs in steady playback. A 10 ms device callback produces 960 samples |
+| The output stage away from boundaries | Unchanged (12.7 ms of CPU per second when resampling, section 10) |
+| Within the 1 ms overlap at a change of rate | Up to three segments contribute instead of one |
+
+### 11.7 Limitations and untested cases
+
+- **Lossy formats:** gapless for MP3 and AAC depends on the decoder trimming encoder delay and padding (rodio's `with_gapless`, on by default). No encoder is installed, so it was not measured; FLAC through the full path was not separately measured either. WAV, AIFF, and (in section 10) FLAC decode through the same chain.
+- **Rate-change edge:** about 0.005 of 0.5 amplitude (−40 dB) for under a millisecond. A track at the output rate following a change of rate is moved by up to half a frame (10.4 µs at 48 kHz) over 0.1 s before it is bit-exact.
+- **Visible state:** the visible current track and play count change at the controller's next tick or command (at most 250 ms after the audio boundary), as before. The audio itself does not wait.
+- **Unplayable next track:** it still causes a gap at that boundary, because it is skipped by the ordinary path.
+- **Old engine's gap:** not measured on the device for comparison; only inferred from the code.
+- **Not tested on hardware:** other devices, sample rates, or Windows 10. No listening test.

@@ -615,6 +615,7 @@ impl AppCore {
             if inner.active_profile_id == profile_id
                 && playback.drop_unavailable(&inner.profile_db)?
             {
+                playback.sync_preload(&inner.profile_db);
                 let _ = playback.save(&inner.profile_db);
             }
         }
@@ -649,7 +650,12 @@ impl AppCore {
     ) -> Result<PlaybackState> {
         let mut playback = self.lock_playback()?;
         let inner = self.lock()?;
-        change(&mut playback, &inner.profile_db, now_unix())?;
+        let now = now_unix();
+        // Account for any track the output moved on to by itself first, so
+        // the change applies to the track actually playing.
+        playback.catch_up(&inner.profile_db, now)?;
+        change(&mut playback, &inner.profile_db, now)?;
+        playback.sync_preload(&inner.profile_db);
         if let Err(error) = playback.save(&inner.profile_db) {
             log::warn!("the queue could not be saved: {error}");
         }
